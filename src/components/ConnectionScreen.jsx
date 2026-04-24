@@ -55,13 +55,13 @@ export default function ConnectionScreen({
     <div className="grid gap-5 sm:gap-6">
       <div className="grid gap-2.5 sm:gap-3">
         <p className="text-[0.62rem] font-medium uppercase tracking-[0.24em] text-zinc-500 sm:text-[0.7rem] sm:tracking-[0.34em]">
-          local-first sharing
+          open source file transfer
         </p>
         <h1 className="max-w-4xl text-[2rem] leading-[0.9] font-semibold uppercase tracking-[-0.08em] text-zinc-950 sm:text-6xl">
-          Send Files Across Your Network.
+          Fast, Private File Sharing.
         </h1>
         <p className="max-w-2xl text-sm leading-6 text-zinc-600 sm:text-base sm:leading-7">
-          Create a private link, open it on another device nearby, and move files directly over your local network.
+          Generate a link, open it on other device on same network and start sharing.
         </p>
       </div>
 
@@ -81,7 +81,7 @@ export default function ConnectionScreen({
       <div className="grid gap-4 border border-zinc-300 p-4 sm:gap-5 sm:p-6">
         <div className="flex items-center justify-between gap-4 border-b border-zinc-200 pb-3 sm:pb-4">
           <span className="text-[0.68rem] font-semibold uppercase tracking-[0.18em] text-zinc-700 sm:text-[0.72rem] sm:tracking-[0.22em]">
-            session
+            transfer session
           </span>
           <Link2 size={16} className="text-black" />
         </div>
@@ -91,7 +91,7 @@ export default function ConnectionScreen({
         {role === 'host' && (
           <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap">
             <button type="button" className={primaryButtonClass} onClick={onGenerateUrl}>
-              Create Transfer Link
+              Generate Share Link
             </button>
           </div>
         )}
@@ -106,18 +106,18 @@ export default function ConnectionScreen({
             />
             <button type="button" className={ghostButtonClass} onClick={handleCopy}>
               <Copy size={14} />
-              <span>{isCopied ? 'Link Copied' : 'Copy Transfer Link'}</span>
+              <span>{isCopied ? 'Share Link Copied' : 'Copy Share Link'}</span>
             </button>
           </div>
         )}
 
         {activeSignalingBase && (
           <p className="break-all text-[0.68rem] uppercase tracking-[0.14em] text-zinc-500 sm:text-xs sm:tracking-[0.18em]">
-            local session host: {activeSignalingBase}
+            local signaling host: {activeSignalingBase}
           </p>
         )}
 
-        {error && <p className="text-sm font-medium text-black">session issue: {error}</p>}
+        {error && <p className="text-sm font-medium text-black">transfer issue: {error}</p>}
       </div>
     </div>
   );

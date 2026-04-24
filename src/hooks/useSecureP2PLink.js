@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-const SIGNALING_BASE = 'http://localhost:3000';
+const LOCAL_SIGNALING_BASE = 'http://localhost:3000';
 const CHUNK_SIZE = 16 * 1024;
 const BUFFER_LIMIT = CHUNK_SIZE * 64;
 const MAX_ICE_GATHER_WAIT_MS = 1200;
@@ -89,6 +89,8 @@ const formatSize = (bytes) => {
   return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
 };
 
+const isLocalhostHost = (hostname) => hostname === 'localhost' || hostname === '127.0.0.1';
+
 export function useSecureP2PLink() {
   const [connectionStatus, setConnectionStatus] = useState('Idle');
   const [connectionDetail, setConnectionDetail] = useState('Generate a LAN link and open it from another device on the same network.');
@@ -109,6 +111,14 @@ export function useSecureP2PLink() {
   const answerPollRef = useRef(null);
   const autoJoinRef = useRef('');
   const incomingFileRef = useRef(null);
+
+  const getHostSignalingBase = useCallback(() => (
+    isLocalhostHost(window.location.hostname) ? LOCAL_SIGNALING_BASE : window.location.origin
+  ), []);
+
+  const getJoinSignalingBase = useCallback((sigHint) => (
+    sigHint || (isLocalhostHost(window.location.hostname) ? LOCAL_SIGNALING_BASE : window.location.origin)
+  ), []);
 
   const cleanupPolling = useCallback(() => {
     if (answerPollRef.current) {
@@ -266,22 +276,22 @@ export function useSecureP2PLink() {
     return pc;
   }, [cleanupPolling, setSecureChannelHandlers]);
 
-  const buildShareUrl = useCallback((offerToken, localIP) => {
+  const buildShareUrl = useCallback((offerToken, signalingBase, localIP) => {
     const params = new URLSearchParams({ offer: offerToken });
-    if (localIP) {
+    if (signalingBase === LOCAL_SIGNALING_BASE && localIP) {
       params.set('sig', `http://${localIP}:3000`);
     }
     return `${window.location.origin}/?${params.toString()}`;
   }, []);
 
-  const beginHostAnswerPolling = useCallback((sessionId, key) => {
+  const beginHostAnswerPolling = useCallback((signalingBase, sessionId, key) => {
     const pollAnswer = async () => {
       if (!peerRef.current) {
         return;
       }
 
       try {
-        const response = await fetch(`${SIGNALING_BASE}/api/session/${sessionId}/answer?key=${encodeURIComponent(key)}`);
+        const response = await fetch(`${signalingBase}/api/session/${sessionId}/answer?key=${encodeURIComponent(key)}`);
         if (response.status === 202) {
           return;
         }
@@ -325,8 +335,9 @@ export function useSecureP2PLink() {
       await pc.setLocalDescription(offer);
       await waitForIceGatheringComplete(pc);
 
+      const signalingBase = getHostSignalingBase();
       const createdSession = await requestJson(
-        `${SIGNALING_BASE}/api/session`,
+        `${signalingBase}/api/session`,
         {
           method: 'POST',
           body: JSON.stringify({ offer: pc.localDescription }),
@@ -335,18 +346,18 @@ export function useSecureP2PLink() {
       );
 
       const { sessionId, key } = parseOfferToken(createdSession.offerToken);
-      setActiveSignalingBase(SIGNALING_BASE);
-      setShareUrl(buildShareUrl(createdSession.offerToken, createdSession.localIP || ''));
+      setActiveSignalingBase(signalingBase);
+      setShareUrl(buildShareUrl(createdSession.offerToken, signalingBase, createdSession.localIP || ''));
       setConnectionStatus('Awaiting Peer');
       setConnectionDetail('Share this link with a device on the same network.');
 
-      beginHostAnswerPolling(sessionId, key);
+      beginHostAnswerPolling(signalingBase, sessionId, key);
     } catch (err) {
       setError(err.message || 'Failed to generate URL');
       setConnectionStatus('Idle');
-      setConnectionDetail('Start the local signaling server and try again.');
+      setConnectionDetail('Unable to start a transfer session. Try again.');
     }
-  }, [beginHostAnswerPolling, buildShareUrl, cleanupConnection, setSecureChannelHandlers, setupPeer]);
+  }, [beginHostAnswerPolling, buildShareUrl, cleanupConnection, getHostSignalingBase, setSecureChannelHandlers, setupPeer]);
 
   const joinFromOfferToken = useCallback(
     async (offerToken, sigHint) => {
@@ -358,7 +369,7 @@ export function useSecureP2PLink() {
         setConnectionDetail('Loading offer from local signaling server...');
 
         const { sessionId, key } = parseOfferToken(offerToken);
-        const signalingBase = sigHint || SIGNALING_BASE;
+        const signalingBase = getJoinSignalingBase(sigHint);
         const sessionData = await requestJson(
           `${signalingBase}/api/session/${sessionId}?key=${encodeURIComponent(key)}`,
           {},
@@ -388,10 +399,10 @@ export function useSecureP2PLink() {
       } catch (err) {
         setError(err.message || 'Failed to join connection');
         setConnectionStatus('Idle');
-        setConnectionDetail('Open a valid LAN link and try again.');
+        setConnectionDetail('Open a valid transfer link and try again.');
       }
     },
-    [cleanupConnection, setupPeer],
+    [cleanupConnection, getJoinSignalingBase, setupPeer],
   );
 
   const sendSelectedFiles = useCallback(async () => {

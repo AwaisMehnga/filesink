@@ -4,8 +4,8 @@ import FileShareScreen from './components/FileShareScreen';
 import { useSecureP2PLink } from './hooks/useSecureP2PLink';
 import  githubIcon from './assets/github.svg';
 
-const GITHUB_REPO_URL = 'https://github.com/awaisemehnga/filesink';
-const LINKEDIN_URL = 'https://www.linkedin.com/in/awaisemehnga/';
+const GITHUB_REPO_URL = 'https://github.com/awaismehnga/filesink';
+const LINKEDIN_URL = 'https://www.linkedin.com/in/awaismehnga/';
 
 function App() {
   const link = useSecureP2PLink();
@@ -85,7 +85,7 @@ function App() {
           >
             <span>made with</span>
             <Heart size={14} className="fill-red-500 text-red-500" />
-            <span>by awaisemehnga</span>
+            <span>by awaismehnga</span>
           </a>
         </div>
       </footer>

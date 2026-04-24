@@ -22,20 +22,29 @@ The shared link includes that LAN signaling address in the `sig` query param so 
 
 ## Cloudflare Pages
 
-The frontend can be deployed to Cloudflare Pages while signaling still runs locally on the sending device.
+The frontend and signaling can both be deployed on Cloudflare Pages.
 
 ```bash
 npm run build
 npm run deploy
 ```
 
-This uses `wrangler.toml` and publishes the `dist` folder to Pages.
+This uses `wrangler.toml`, publishes the `dist` folder, and serves signaling from `functions/api/[[route]].js`.
+
+Before deploying, create a KV namespace for session storage:
+
+```bash
+wrangler kv namespace create SIGNALING_SESSIONS
+wrangler kv namespace create SIGNALING_SESSIONS --preview
+```
+
+Then replace the placeholder IDs in `wrangler.toml`.
 
 Important:
 
-- The website can be hosted on Pages.
-- The signaling server must still be running locally on the sender with `npm run server`.
-- The generated link includes the sender's LAN signaling address so another device on the same network can connect.
+- `server.js` is still useful for local development.
+- The deployed Pages app uses same-origin signaling instead of the local Node server.
+- This app is still intended for devices on the same network.
 
 ## Notes
 
