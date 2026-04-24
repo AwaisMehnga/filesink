@@ -1,4 +1,4 @@
-import { GitPullRequest, Heart } from 'lucide-react';
+import { Heart } from 'lucide-react';
 import ConnectionScreen from './components/ConnectionScreen';
 import FileShareScreen from './components/FileShareScreen';
 import { useSecureP2PLink } from './hooks/useSecureP2PLink';
@@ -13,16 +13,16 @@ function App() {
   return (
     <main className="flex min-h-screen overflow-x-hidden flex-col bg-white text-black">
       <header className="border-b border-brand-200 bg-white">
-        <div className="mx-auto flex w-full max-w-6xl items-center justify-between px-4 py-4 sm:px-6">
-          <div className="flex items-center gap-3" aria-label="filesink logo">
-            <span className="grid h-9 w-9 place-items-center border border-black bg-brand-500 text-xs font-bold uppercase tracking-[0.24em] text-white">
+        <div className="mx-auto flex w-full max-w-6xl items-center justify-between gap-3 px-4 py-3 sm:px-6 sm:py-4">
+          <div className="flex min-w-0 items-center gap-3" aria-label="filesink logo">
+            <span className="grid h-9 w-9 shrink-0 place-items-center border border-black bg-brand-500 text-xs font-bold uppercase tracking-[0.24em] text-white">
               fs
             </span>
-            <div>
-              <p className="text-[0.65rem] font-medium uppercase tracking-[0.3em] text-zinc-500">
+            <div className="min-w-0">
+              <p className="text-[0.58rem] font-medium uppercase tracking-[0.24em] text-zinc-500 sm:text-[0.65rem] sm:tracking-[0.3em]">
                 direct transfer
               </p>
-              <p className="text-base font-semibold uppercase tracking-[0.18em] sm:text-lg">
+              <p className="truncate text-sm font-semibold uppercase tracking-[0.16em] sm:text-lg sm:tracking-[0.18em]">
                 filesink
               </p>
             </div>
@@ -40,7 +40,7 @@ function App() {
         </div>
       </header>
 
-      <section className="flex flex-1 items-center justify-center overflow-x-hidden px-4 py-8 sm:px-6">
+      <section className="flex flex-1 items-center justify-center overflow-x-hidden px-4 py-5 sm:px-6 sm:py-8">
         <div className="w-full max-w-5xl overflow-x-hidden bg-white">
           {link.isConnected ? (
             <FileShareScreen
@@ -52,7 +52,6 @@ function App() {
               currentReceiveName={link.currentReceiveName}
               receivedFiles={link.receivedFiles}
               connectionStatus={link.connectionStatus}
-              networkMode={link.networkMode}
               error={link.error}
               formatSize={link.formatSize}
               onSelectFiles={link.selectFiles}
@@ -67,7 +66,6 @@ function App() {
               connectionStatus={link.connectionStatus}
               connectionDetail={link.connectionDetail}
               activeSignalingBase={link.activeSignalingBase}
-              networkMode={link.networkMode}
               error={link.error}
               onGenerateUrl={link.createConnectionUrl}
               onDisconnect={link.disconnect}
@@ -77,9 +75,9 @@ function App() {
       </section>
 
       <footer className="mt-auto border-t border-brand-200 bg-white">
-        <div className="mx-auto w-full max-w-6xl px-4 py-4 sm:px-6 text-center">
+        <div className="mx-auto w-full max-w-6xl px-4 py-3 text-center sm:px-6 sm:py-4">
           <a
-            className="inline-flex items-center gap-2 text-sm font-medium text-zinc-700 transition hover:text-black"
+            className="inline-flex flex-wrap items-center justify-center gap-2 text-center text-xs font-medium text-zinc-700 transition hover:text-black sm:text-sm"
             href={LINKEDIN_URL}
             target="_blank"
             rel="noreferrer"

@@ -15,6 +15,7 @@
 
   html {
     font-family: "IBM Plex Mono", "Courier New", monospace;
+    -webkit-text-size-adjust: 100%;
   }
 
   body {
@@ -25,6 +26,7 @@
       linear-gradient(rgba(0, 0, 0, 0.06) 1px, transparent 1px),
       #ffffff;
     background-size: 28px 28px;
+    overflow-x: hidden;
   }
 
   button,
@@ -32,6 +34,10 @@
   textarea,
   a {
     font: inherit;
+  }
+
+  textarea {
+    border-radius: 0;
   }
 }
 

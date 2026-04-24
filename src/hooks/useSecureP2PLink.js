@@ -1,11 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
-const DEFAULT_CLOUD_SIGNALING = '';
+const SIGNALING_BASE = 'http://localhost:3000';
 const CHUNK_SIZE = 16 * 1024;
 const BUFFER_LIMIT = CHUNK_SIZE * 64;
-const SESSION_STORAGE_KEY = 'secure-p2p-session';
 const MAX_ICE_GATHER_WAIT_MS = 1200;
-const STATUS_POLL_INTERVAL_MS = 1500;
 
 const waitForIceGatheringComplete = (pc) =>
   new Promise((resolve) => {
@@ -58,29 +56,13 @@ const requestJson = async (url, options = {}, timeoutMs = 8000) => {
     const data = await response.json().catch(() => ({}));
 
     if (!response.ok) {
-      const message = data.error || `Request failed (${response.status})`;
-      const error = new Error(message);
-      error.status = response.status;
-      throw error;
+      throw new Error(data.error || `Request failed (${response.status})`);
     }
 
     return data;
   } finally {
     clearTimeout(timeout);
   }
-};
-
-const uniqueBases = (bases) => {
-  const seen = new Set();
-  return bases
-    .map((base) => base?.trim())
-    .filter((base) => {
-      if (!base || seen.has(base)) {
-        return false;
-      }
-      seen.add(base);
-      return true;
-    });
 };
 
 const waitForChannelCapacity = (channel) =>
@@ -107,98 +89,13 @@ const formatSize = (bytes) => {
   return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
 };
 
-const getStoredSession = () => {
-  try {
-    const raw = sessionStorage.getItem(SESSION_STORAGE_KEY);
-    if (!raw) return null;
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-};
-
-const setStoredSession = (session) => {
-  try {
-    sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
-  } catch {
-    // Ignore storage errors.
-  }
-};
-
-const clearStoredSession = () => {
-  try {
-    sessionStorage.removeItem(SESSION_STORAGE_KEY);
-  } catch {
-    // Ignore storage errors.
-  }
-};
-
-const isLocalhostHost = (hostname) => hostname === 'localhost' || hostname === '127.0.0.1';
-const isPrivateIpv4Hostname = (hostname) => {
-  if (!hostname) {
-    return false;
-  }
-
-  if (hostname.startsWith('10.')) {
-    return true;
-  }
-
-  if (hostname.startsWith('192.168.')) {
-    return true;
-  }
-
-  const match = hostname.match(/^172\.(\d{1,3})\./);
-  if (!match) {
-    return false;
-  }
-
-  const secondOctet = Number(match[1]);
-  return secondOctet >= 16 && secondOctet <= 31;
-};
-
-const getNetworkModeFromBase = (base) => {
-  try {
-    const { hostname } = new URL(base);
-    return isLocalhostHost(hostname) || isPrivateIpv4Hostname(hostname) ? 'lan' : 'internet';
-  } catch {
-    return 'internet';
-  }
-};
-
-const buildSigHint = (signalingBase, localIP = '') => {
-  try {
-    const { hostname, port, protocol } = new URL(signalingBase);
-    if (isLocalhostHost(hostname)) {
-      if (!localIP) {
-        return '';
-      }
-
-      return `${protocol}//${localIP}${port ? `:${port}` : ''}`;
-    }
-
-    if (isPrivateIpv4Hostname(hostname)) {
-      return signalingBase;
-    }
-
-    return '';
-  } catch {
-    return '';
-  }
-};
-
-const extractCandidateType = (candidate = '') => {
-  const match = String(candidate).match(/\btyp\s+([a-z]+)/i);
-  return match?.[1]?.toLowerCase() || '';
-};
-
 export function useSecureP2PLink() {
   const [connectionStatus, setConnectionStatus] = useState('Idle');
-  const [connectionDetail, setConnectionDetail] = useState('Create a secure connection URL.');
+  const [connectionDetail, setConnectionDetail] = useState('Generate a LAN link and open it from another device on the same network.');
   const [shareUrl, setShareUrl] = useState('');
   const [role, setRole] = useState('host');
   const [error, setError] = useState('');
   const [activeSignalingBase, setActiveSignalingBase] = useState('');
-  const [networkMode, setNetworkMode] = useState('internet');
   const [selectedFiles, setSelectedFiles] = useState([]);
   const [isSending, setIsSending] = useState(false);
   const [sendProgress, setSendProgress] = useState(0);
@@ -210,65 +107,13 @@ export function useSecureP2PLink() {
   const peerRef = useRef(null);
   const channelRef = useRef(null);
   const answerPollRef = useRef(null);
-  const sessionStatusPollRef = useRef(null);
-  const peerSessionPollRef = useRef(null);
-  const hostReconnectTimeoutRef = useRef(null);
-  const hostReconnectInFlightRef = useRef(false);
-  const peerReconnectInFlightRef = useRef(false);
-  const joinFromOfferTokenRef = useRef(null);
-  const resumeHostSessionRef = useRef(null);
   const autoJoinRef = useRef('');
   const incomingFileRef = useRef(null);
-
-  const envSignaling = useMemo(() => import.meta.env.VITE_SIGNALING_URL || '', []);
-  const stunUrls = useMemo(() => {
-    const configured = (import.meta.env.VITE_STUN_URLS || '')
-      .split(',')
-      .map((url) => url.trim())
-      .filter(Boolean);
-
-    if (configured.length) {
-      return configured;
-    }
-
-    return ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'];
-  }, []);
-  const turnConfig = useMemo(
-    () => ({
-      url: import.meta.env.VITE_TURN_URL || '',
-      username: import.meta.env.VITE_TURN_USERNAME || '',
-      credential: import.meta.env.VITE_TURN_CREDENTIAL || '',
-    }),
-    [],
-  );
-  const hasTurnConfigured = useMemo(
-    () => Boolean(turnConfig.url && turnConfig.username && turnConfig.credential),
-    [turnConfig],
-  );
-  const hasPartialTurnConfig = useMemo(
-    () => Boolean(turnConfig.url || turnConfig.username || turnConfig.credential) && !hasTurnConfigured,
-    [hasTurnConfigured, turnConfig],
-  );
 
   const cleanupPolling = useCallback(() => {
     if (answerPollRef.current) {
       clearInterval(answerPollRef.current);
       answerPollRef.current = null;
-    }
-
-    if (sessionStatusPollRef.current) {
-      clearInterval(sessionStatusPollRef.current);
-      sessionStatusPollRef.current = null;
-    }
-
-    if (hostReconnectTimeoutRef.current) {
-      clearTimeout(hostReconnectTimeoutRef.current);
-      hostReconnectTimeoutRef.current = null;
-    }
-
-    if (peerSessionPollRef.current) {
-      clearInterval(peerSessionPollRef.current);
-      peerSessionPollRef.current = null;
     }
   }, []);
 
@@ -279,6 +124,7 @@ export function useSecureP2PLink() {
     if (channelRef.current) {
       channelRef.current.onopen = null;
       channelRef.current.onclose = null;
+      channelRef.current.onmessage = null;
       channelRef.current.close();
       channelRef.current = null;
     }
@@ -304,298 +150,6 @@ export function useSecureP2PLink() {
     });
   }, []);
 
-  const buildIceServers = useCallback(() => {
-    const servers = stunUrls.map((url) => ({ urls: url }));
-
-    if (hasTurnConfigured) {
-      servers.push({
-        urls: turnConfig.url,
-        username: turnConfig.username,
-        credential: turnConfig.credential,
-      });
-    }
-
-    return servers;
-  }, [hasTurnConfigured, stunUrls, turnConfig]);
-
-  const diagnoseIceFailure = useCallback(async (pc) => {
-    const observedTypes = new Set();
-
-    try {
-      const stats = await pc.getStats();
-      stats.forEach((report) => {
-        if (report.type === 'local-candidate' || report.type === 'remote-candidate') {
-          if (report.candidateType) {
-            observedTypes.add(report.candidateType);
-          }
-        }
-
-        if (report.type === 'candidate-pair' && report.state === 'succeeded') {
-          if (report.localCandidateId) {
-            const local = stats.get(report.localCandidateId);
-            if (local?.candidateType) {
-              observedTypes.add(local.candidateType);
-            }
-          }
-
-          if (report.remoteCandidateId) {
-            const remote = stats.get(report.remoteCandidateId);
-            if (remote?.candidateType) {
-              observedTypes.add(remote.candidateType);
-            }
-          }
-        }
-      });
-    } catch {
-      // Ignore stats errors and fall back to generic guidance.
-    }
-
-    if (hasPartialTurnConfig) {
-      return 'Connection failed. TURN is only partially configured; set VITE_TURN_URL, VITE_TURN_USERNAME, and VITE_TURN_CREDENTIAL.';
-    }
-
-    if (!hasTurnConfigured) {
-      return 'Connection failed. Different networks usually need a TURN relay; only STUN is configured right now.';
-    }
-
-    if (!observedTypes.size) {
-      return 'Connection failed after signaling. TURN is configured, but ICE could not find any usable network path.';
-    }
-
-    if (!observedTypes.has('relay')) {
-      return `Connection failed. ICE candidates were ${Array.from(observedTypes).join(', ') || 'unavailable'}, but no relay path succeeded.`;
-    }
-
-    return 'Connection failed. A relay candidate existed, but the TURN route still did not connect.';
-  }, [hasPartialTurnConfig, hasTurnConfigured]);
-
-  const setupPeer = useCallback((peerRole) => {
-    const pc = new RTCPeerConnection({
-      iceServers: buildIceServers(),
-      iceCandidatePoolSize: 2,
-    });
-
-    pc.onicecandidate = (event) => {
-      const candidateType = extractCandidateType(event.candidate?.candidate || '');
-      if (candidateType) {
-        console.debug('[webrtc] local ICE candidate', { type: candidateType, role: peerRole });
-      }
-    };
-
-    pc.onicecandidateerror = (event) => {
-      console.warn('[webrtc] ICE candidate error', {
-        role: peerRole,
-        address: event.address,
-        port: event.port,
-        url: event.url,
-        errorCode: event.errorCode,
-        errorText: event.errorText,
-      });
-    };
-
-    pc.oniceconnectionstatechange = () => {
-      const state = pc.iceConnectionState;
-
-      if (state === 'checking') {
-        setConnectionDetail('Exchanging ICE candidates and testing network paths...');
-      } else if (state === 'connected' || state === 'completed') {
-        setConnectionDetail('ICE connected. Opening secure data channel...');
-      } else if (state === 'failed') {
-        diagnoseIceFailure(pc).then((message) => {
-          if (peerRef.current === pc) {
-            setConnectionStatus('Failed');
-            setConnectionDetail(message);
-          }
-        });
-      }
-    };
-
-    pc.onconnectionstatechange = () => {
-      const state = pc.connectionState;
-
-      if (state === 'connected') {
-        cleanupPolling();
-        setConnectionStatus('Connected');
-        setConnectionDetail('Direct secure WebRTC tunnel established.');
-      } else if (state === 'connecting') {
-        setConnectionStatus('Connecting');
-        setConnectionDetail('Negotiating secure peer channel...');
-      } else if (state === 'failed') {
-        cleanupPolling();
-        setConnectionStatus('Failed');
-        diagnoseIceFailure(pc).then((message) => {
-          if (peerRef.current === pc) {
-            setConnectionDetail(message);
-          }
-        });
-      } else if (state === 'disconnected' || state === 'closed') {
-        setConnectionStatus('Closed');
-        setConnectionDetail('Peer disconnected.');
-
-        if (
-          peerRole === 'host'
-          && !hostReconnectTimeoutRef.current
-          && getStoredSession()?.role === 'host'
-        ) {
-          hostReconnectTimeoutRef.current = setTimeout(() => {
-            hostReconnectTimeoutRef.current = null;
-
-            if (hostReconnectInFlightRef.current) {
-              return;
-            }
-
-            const storedSession = getStoredSession();
-            if (!storedSession?.offerToken || storedSession.role !== 'host') {
-              return;
-            }
-
-            hostReconnectInFlightRef.current = true;
-            setConnectionStatus('Reconnecting');
-            setConnectionDetail('Peer disconnected. Publishing a fresh secure offer...');
-
-            const reconnect = resumeHostSessionRef.current?.(storedSession);
-            if (!reconnect) {
-              hostReconnectInFlightRef.current = false;
-              return;
-            }
-
-            reconnect
-              .catch((err) => {
-                clearStoredSession();
-                setError(err.message || 'Could not restore host session.');
-              })
-              .finally(() => {
-                hostReconnectInFlightRef.current = false;
-              });
-          }, 1200);
-        }
-      }
-    };
-
-    peerRef.current = pc;
-    return pc;
-  }, [buildIceServers, cleanupPolling, diagnoseIceFailure]);
-
-  const startStatusPolling = useCallback((base, sessionId, key) => {
-    let inFlight = false;
-
-    const pollStatus = async () => {
-      if (inFlight) {
-        return;
-      }
-
-      inFlight = true;
-      try {
-        const data = await requestJson(`${base}/api/session/${sessionId}/status?key=${encodeURIComponent(key)}`, {}, 4000);
-        if (data.status === 'joined') {
-          setConnectionStatus('Peer Joined');
-          setConnectionDetail('Peer opened your URL and is creating answer.');
-        }
-        if (data.status === 'answered' || data.status === 'connected') {
-          if (sessionStatusPollRef.current) {
-            clearInterval(sessionStatusPollRef.current);
-            sessionStatusPollRef.current = null;
-          }
-        }
-      } catch {
-        // Ignore transient polling errors.
-      } finally {
-        inFlight = false;
-      }
-    };
-
-    pollStatus();
-    sessionStatusPollRef.current = setInterval(pollStatus, STATUS_POLL_INTERVAL_MS);
-  }, []);
-
-  const startPeerSessionPolling = useCallback((offerToken, sigHint, signalingBase) => {
-    const { sessionId, key } = parseOfferToken(offerToken);
-    let inFlight = false;
-
-    const pollSession = async () => {
-      if (inFlight) {
-        return;
-      }
-
-      inFlight = true;
-      try {
-        const data = await requestJson(
-          `${signalingBase}/api/session/${sessionId}/status?key=${encodeURIComponent(key)}`,
-          {},
-          4000,
-        );
-
-        if (data.status === 'answered' || data.status === 'connected') {
-          if (peerSessionPollRef.current) {
-            clearInterval(peerSessionPollRef.current);
-            peerSessionPollRef.current = null;
-          }
-          return;
-        }
-
-        if (data.status !== 'waiting' || peerReconnectInFlightRef.current) {
-          return;
-        }
-
-        const currentState = peerRef.current?.connectionState;
-        if (currentState === 'connecting') {
-          return;
-        }
-
-        peerReconnectInFlightRef.current = true;
-        const reconnect = joinFromOfferTokenRef.current?.(offerToken, sigHint || signalingBase);
-        if (!reconnect) {
-          peerReconnectInFlightRef.current = false;
-          return;
-        }
-
-        reconnect.finally(() => {
-          peerReconnectInFlightRef.current = false;
-        });
-      } catch {
-        // Ignore transient polling errors.
-      } finally {
-        inFlight = false;
-      }
-    };
-
-    pollSession();
-    peerSessionPollRef.current = setInterval(pollSession, STATUS_POLL_INTERVAL_MS);
-  }, []);
-
-  const beginHostAnswerPolling = useCallback((base, sessionId, key) => {
-    const pollAnswer = async () => {
-      if (!peerRef.current) {
-        return;
-      }
-
-      try {
-        const response = await fetch(`${base}/api/session/${sessionId}/answer?key=${encodeURIComponent(key)}`);
-        if (response.status === 202) {
-          return;
-        }
-
-        const data = await response.json();
-        if (!response.ok) {
-          throw new Error(data.error || 'Unable to fetch answer');
-        }
-
-        if (data.answer && peerRef.current.signalingState !== 'closed') {
-          clearInterval(answerPollRef.current);
-          answerPollRef.current = null;
-          await peerRef.current.setRemoteDescription(data.answer);
-          setConnectionStatus('Peer Connected');
-          setConnectionDetail('Peer answer accepted. Finalizing encrypted data channel.');
-        }
-      } catch {
-        // Ignore transient polling errors.
-      }
-    };
-
-    pollAnswer();
-    answerPollRef.current = setInterval(pollAnswer, 400);
-  }, []);
-
   const setSecureChannelHandlers = useCallback(() => {
     if (!channelRef.current) {
       return;
@@ -606,31 +160,18 @@ export function useSecureP2PLink() {
     channelRef.current.onopen = () => {
       cleanupPolling();
       setConnectionStatus('Connected');
-      setConnectionDetail('Secure data channel open (DTLS encrypted).');
-
-      try {
-        channelRef.current.send(JSON.stringify({ type: 'peer-ready', at: Date.now() }));
-      } catch {
-        // Ignore transient send errors.
-      }
+      setConnectionDetail('Secure data channel open.');
     };
 
     channelRef.current.onclose = () => {
       setConnectionStatus('Closed');
-      setConnectionDetail('Secure channel closed.');
+      setConnectionDetail('Channel closed.');
     };
 
     channelRef.current.onmessage = async (event) => {
       if (typeof event.data === 'string') {
         try {
           const message = JSON.parse(event.data);
-
-          if (message?.type === 'peer-ready') {
-            cleanupPolling();
-            setConnectionStatus('Connected');
-            setConnectionDetail('Peer is connected and ready.');
-            return;
-          }
 
           if (message?.type === 'file-meta') {
             incomingFileRef.current = {
@@ -691,133 +232,80 @@ export function useSecureP2PLink() {
     };
   }, [cleanupPolling]);
 
-  const getHostSignalingCandidates = useCallback(() => {
-    const isLocalhost = isLocalhostHost(window.location.hostname);
-    const sameOrigin = window.location.origin;
+  const setupPeer = useCallback((peerRole) => {
+    const pc = new RTCPeerConnection();
 
-    if (isLocalhost) {
-      return uniqueBases([
-        'http://localhost:3000',
-        envSignaling,
-        DEFAULT_CLOUD_SIGNALING,
-      ]);
+    pc.onconnectionstatechange = () => {
+      const state = pc.connectionState;
+
+      if (state === 'connected') {
+        cleanupPolling();
+        setConnectionStatus('Connected');
+        setConnectionDetail('Direct LAN connection established.');
+      } else if (state === 'connecting') {
+        setConnectionStatus('Connecting');
+        setConnectionDetail('Connecting to peer on the same network...');
+      } else if (state === 'failed') {
+        cleanupPolling();
+        setConnectionStatus('Failed');
+        setConnectionDetail('Connection failed. Make sure both devices are on the same network.');
+      } else if (state === 'disconnected' || state === 'closed') {
+        setConnectionStatus('Closed');
+        setConnectionDetail('Peer disconnected.');
+      }
+    };
+
+    if (peerRole === 'peer') {
+      pc.ondatachannel = (event) => {
+        channelRef.current = event.channel;
+        setSecureChannelHandlers();
+      };
     }
 
-    return uniqueBases([
-      envSignaling,
-      sameOrigin,
-      DEFAULT_CLOUD_SIGNALING,
-    ]);
-  }, [envSignaling]);
+    peerRef.current = pc;
+    return pc;
+  }, [cleanupPolling, setSecureChannelHandlers]);
 
-  const getJoinSignalingCandidates = useCallback((sigHint) => {
-    const isLocalhost = isLocalhostHost(window.location.hostname);
-    const sameOrigin = window.location.origin;
-
-    if (isLocalhost) {
-      return uniqueBases([
-        sigHint,
-        'http://localhost:3000',
-        envSignaling,
-        DEFAULT_CLOUD_SIGNALING,
-      ]);
-    }
-
-    return uniqueBases([
-      envSignaling,
-      sameOrigin,
-      DEFAULT_CLOUD_SIGNALING,
-      sigHint,
-    ]);
-  }, [envSignaling]);
-
-  const buildShareUrl = useCallback((offerToken, sigHint = '') => {
+  const buildShareUrl = useCallback((offerToken, localIP) => {
     const params = new URLSearchParams({ offer: offerToken });
-    if (sigHint) {
-      params.set('sig', sigHint);
+    if (localIP) {
+      params.set('sig', `http://${localIP}:3000`);
     }
     return `${window.location.origin}/?${params.toString()}`;
   }, []);
 
-  const resumeHostSession = useCallback(async (stored) => {
-    const { offerToken, signalingBase: storedBase, networkMode: storedMode } = stored || {};
-    if (!offerToken || !storedBase) {
-      throw new Error('No stored host session found.');
-    }
-
-    const { sessionId, key } = parseOfferToken(offerToken);
-    const candidates = uniqueBases([storedBase]);
-
-    cleanupConnection();
-    setRole('host');
-    setError('');
-    setConnectionStatus('Reconnecting');
-    setConnectionDetail('Restoring host session after reload...');
-
-    const pc = setupPeer('host');
-    const channel = pc.createDataChannel('secure-link', { ordered: true });
-    channelRef.current = channel;
-    setSecureChannelHandlers();
-
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    await waitForIceGatheringComplete(pc);
-
-    let selectedBase = '';
-    let updateResult = null;
-
-    for (const base of candidates) {
-      try {
-        const data = await requestJson(
-          `${base}/api/session/${sessionId}/offer?key=${encodeURIComponent(key)}`,
-          {
-            method: 'PUT',
-            body: JSON.stringify({ offer: pc.localDescription }),
-          },
-          5000,
-        );
-        selectedBase = base;
-        updateResult = data;
-        break;
-      } catch {
-        // Try next signaling endpoint.
+  const beginHostAnswerPolling = useCallback((sessionId, key) => {
+    const pollAnswer = async () => {
+      if (!peerRef.current) {
+        return;
       }
-    }
 
-    if (!selectedBase || !updateResult) {
-      clearStoredSession();
-      throw new Error('Stored session expired or signaling server changed. Generate a new URL.');
-    }
+      try {
+        const response = await fetch(`${SIGNALING_BASE}/api/session/${sessionId}/answer?key=${encodeURIComponent(key)}`);
+        if (response.status === 202) {
+          return;
+        }
 
-    setActiveSignalingBase(selectedBase);
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || 'Unable to fetch answer');
+        }
 
-    const resolvedSigHint = buildSigHint(selectedBase, updateResult.localIP || '');
-    const mode = storedMode || getNetworkModeFromBase(resolvedSigHint || selectedBase);
-    setNetworkMode(mode);
+        if (data.answer && peerRef.current.signalingState !== 'closed') {
+          clearInterval(answerPollRef.current);
+          answerPollRef.current = null;
+          await peerRef.current.setRemoteDescription(data.answer);
+          setConnectionStatus('Peer Joined');
+          setConnectionDetail('Peer connected. Finishing secure channel setup.');
+        }
+      } catch {
+        // Ignore transient polling errors.
+      }
+    };
 
-    setShareUrl(buildShareUrl(offerToken, resolvedSigHint));
-
-    setStoredSession({
-      offerToken,
-      role: 'host',
-      signalingBase: selectedBase,
-      networkMode: mode,
-      sigHint: resolvedSigHint,
-    });
-
-    setConnectionStatus('Awaiting Peer');
-    setConnectionDetail('Session restored. Waiting for peer to reconnect.');
-
-    startStatusPolling(selectedBase, sessionId, key);
-    beginHostAnswerPolling(selectedBase, sessionId, key);
-  }, [
-    beginHostAnswerPolling,
-    buildShareUrl,
-    cleanupConnection,
-    setSecureChannelHandlers,
-    setupPeer,
-    startStatusPolling,
-  ]);
+    pollAnswer();
+    answerPollRef.current = setInterval(pollAnswer, 500);
+  }, []);
 
   const createConnectionUrl = useCallback(async () => {
     try {
@@ -826,7 +314,7 @@ export function useSecureP2PLink() {
       setShareUrl('');
       cleanupConnection();
       setConnectionStatus('Creating Offer');
-      setConnectionDetail('Preparing secure WebRTC offer...');
+      setConnectionDetail('Preparing local network connection...');
 
       const pc = setupPeer('host');
       const channel = pc.createDataChannel('secure-link', { ordered: true });
@@ -837,73 +325,28 @@ export function useSecureP2PLink() {
       await pc.setLocalDescription(offer);
       await waitForIceGatheringComplete(pc);
 
-      const candidates = getHostSignalingCandidates();
-      let createdSession = null;
-      let selectedBase = '';
-
-      for (const base of candidates) {
-        try {
-          const data = await requestJson(
-            `${base}/api/session`,
-            {
-              method: 'POST',
-              body: JSON.stringify({ offer: pc.localDescription }),
-            },
-            5000,
-          );
-
-          createdSession = data;
-          selectedBase = base;
-          break;
-        } catch {
-          // Try the next signaling endpoint.
-        }
-      }
-
-      if (!createdSession || !selectedBase) {
-        throw new Error(
-          isLocalhostHost(window.location.hostname)
-            ? 'Unable to reach signaling server'
-            : 'Public signaling server is not configured or unreachable. Set VITE_SIGNALING_URL for live deploys.',
-        );
-      }
+      const createdSession = await requestJson(
+        `${SIGNALING_BASE}/api/session`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ offer: pc.localDescription }),
+        },
+        5000,
+      );
 
       const { sessionId, key } = parseOfferToken(createdSession.offerToken);
-      setActiveSignalingBase(selectedBase);
-
-      const persistedSigHint = buildSigHint(selectedBase, createdSession.localIP || '');
-      setNetworkMode(getNetworkModeFromBase(persistedSigHint || selectedBase));
-
-      const shareLink = buildShareUrl(createdSession.offerToken, persistedSigHint);
-      setShareUrl(shareLink);
-
-      setStoredSession({
-        offerToken: createdSession.offerToken,
-        role: 'host',
-        signalingBase: selectedBase,
-        networkMode: getNetworkModeFromBase(persistedSigHint || selectedBase),
-        sigHint: persistedSigHint,
-      });
-
+      setActiveSignalingBase(SIGNALING_BASE);
+      setShareUrl(buildShareUrl(createdSession.offerToken, createdSession.localIP || ''));
       setConnectionStatus('Awaiting Peer');
-      setConnectionDetail('Share URL with one peer. Session expires automatically.');
+      setConnectionDetail('Share this link with a device on the same network.');
 
-      startStatusPolling(selectedBase, sessionId, key);
-      beginHostAnswerPolling(selectedBase, sessionId, key);
+      beginHostAnswerPolling(sessionId, key);
     } catch (err) {
       setError(err.message || 'Failed to generate URL');
       setConnectionStatus('Idle');
-      setConnectionDetail('Try generating a new URL.');
+      setConnectionDetail('Start the local signaling server and try again.');
     }
-  }, [
-    beginHostAnswerPolling,
-    buildShareUrl,
-    cleanupConnection,
-    getHostSignalingCandidates,
-    setSecureChannelHandlers,
-    setupPeer,
-    startStatusPolling,
-  ]);
+  }, [beginHostAnswerPolling, buildShareUrl, cleanupConnection, setSecureChannelHandlers, setupPeer]);
 
   const joinFromOfferToken = useCallback(
     async (offerToken, sigHint) => {
@@ -912,57 +355,19 @@ export function useSecureP2PLink() {
         setRole('peer');
         cleanupConnection();
         setConnectionStatus('Joining');
-        setConnectionDetail('Loading secure offer from signaling service...');
+        setConnectionDetail('Loading offer from local signaling server...');
 
         const { sessionId, key } = parseOfferToken(offerToken);
-        const candidates = getJoinSignalingCandidates(sigHint);
-        let sessionData = null;
-        let selectedBase = '';
-        let lastError = null;
+        const signalingBase = sigHint || SIGNALING_BASE;
+        const sessionData = await requestJson(
+          `${signalingBase}/api/session/${sessionId}?key=${encodeURIComponent(key)}`,
+          {},
+          5000,
+        );
 
-        for (const base of candidates) {
-          try {
-            const data = await requestJson(`${base}/api/session/${sessionId}?key=${encodeURIComponent(key)}`, {}, 5000);
-            sessionData = data;
-            selectedBase = base;
-            break;
-          } catch (err) {
-            lastError = err;
-            if (err?.status && err.status !== 404) {
-              break;
-            }
-          }
-        }
-
-        if (!sessionData || !selectedBase) {
-          clearStoredSession();
-          throw (
-            lastError
-            || new Error(
-              isLocalhostHost(window.location.hostname)
-                ? 'Offer was not found, expired, or already used'
-                : 'Offer could not be loaded from a public signaling server. Check VITE_SIGNALING_URL or the shared link.',
-            )
-          );
-        }
-
-        setActiveSignalingBase(selectedBase);
-        setNetworkMode(getNetworkModeFromBase(selectedBase));
-
-        setStoredSession({
-          offerToken,
-          role: 'peer',
-          signalingBase: selectedBase,
-          networkMode: getNetworkModeFromBase(selectedBase),
-          sigHint,
-        });
+        setActiveSignalingBase(signalingBase);
 
         const pc = setupPeer('peer');
-        pc.ondatachannel = (event) => {
-          channelRef.current = event.channel;
-          setSecureChannelHandlers();
-        };
-
         await pc.setRemoteDescription(sessionData.offer);
 
         const answer = await pc.createAnswer();
@@ -970,7 +375,7 @@ export function useSecureP2PLink() {
         await waitForIceGatheringComplete(pc);
 
         await requestJson(
-          `${selectedBase}/api/session/${sessionId}/answer?key=${encodeURIComponent(key)}`,
+          `${signalingBase}/api/session/${sessionId}/answer?key=${encodeURIComponent(key)}`,
           {
             method: 'POST',
             body: JSON.stringify({ answer: pc.localDescription }),
@@ -979,23 +384,19 @@ export function useSecureP2PLink() {
         );
 
         setConnectionStatus('Answer Sent');
-        setConnectionDetail('Waiting for host to finalize secure connection.');
-        startPeerSessionPolling(offerToken, sigHint, selectedBase);
+        setConnectionDetail('Waiting for the host to finish the LAN connection.');
       } catch (err) {
-        if (err?.status === 403 || err?.status === 404) {
-          clearStoredSession();
-        }
         setError(err.message || 'Failed to join connection');
         setConnectionStatus('Idle');
-        setConnectionDetail('Open a valid URL and try again.');
+        setConnectionDetail('Open a valid LAN link and try again.');
       }
     },
-    [cleanupConnection, getJoinSignalingCandidates, setSecureChannelHandlers, setupPeer, startPeerSessionPolling],
+    [cleanupConnection, setupPeer],
   );
 
   const sendSelectedFiles = useCallback(async () => {
     if (!channelRef.current || channelRef.current.readyState !== 'open') {
-      setError('Channel is not open. Reconnect and try again.');
+      setError('Channel is not open.');
       return;
     }
 
@@ -1067,26 +468,19 @@ export function useSecureP2PLink() {
 
   const disconnect = useCallback(() => {
     cleanupConnection();
-    clearStoredSession();
     clearAllFiles();
     setShareUrl('');
     setRole('host');
     setError('');
     setActiveSignalingBase('');
-    setNetworkMode('internet');
     setIsSending(false);
     setConnectionStatus('Idle');
-    setConnectionDetail('Create a secure connection URL.');
+    setConnectionDetail('Generate a LAN link and open it from another device on the same network.');
     autoJoinRef.current = '';
 
     const cleanUrl = `${window.location.origin}${window.location.pathname}`;
     window.history.replaceState({}, '', cleanUrl);
   }, [cleanupConnection, clearAllFiles]);
-
-  useEffect(() => {
-    resumeHostSessionRef.current = resumeHostSession;
-    joinFromOfferTokenRef.current = joinFromOfferToken;
-  }, [joinFromOfferToken, resumeHostSession]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -1104,27 +498,6 @@ export function useSecureP2PLink() {
       queueMicrotask(() => {
         joinFromOfferToken(offer, sig || '');
       });
-      return () => {
-        cleanupConnection();
-      };
-    }
-
-    const stored = getStoredSession();
-    if (stored?.offerToken && stored?.role === 'host') {
-      queueMicrotask(() => {
-        resumeHostSession(stored).catch((err) => {
-          clearStoredSession();
-          setError(err.message || 'Could not restore host session.');
-        });
-      });
-    }
-
-    if (stored?.offerToken && stored?.role === 'peer') {
-      queueMicrotask(() => {
-        joinFromOfferToken(stored.offerToken, stored.sigHint || stored.signalingBase || '').catch(() => {
-          // Error is handled inside joinFromOfferToken.
-        });
-      });
     }
 
     return () => {
@@ -1132,7 +505,7 @@ export function useSecureP2PLink() {
       revokeReceivedFileUrls();
       autoJoinRef.current = '';
     };
-  }, [cleanupConnection, joinFromOfferToken, resumeHostSession, revokeReceivedFileUrls]);
+  }, [cleanupConnection, joinFromOfferToken, revokeReceivedFileUrls]);
 
   return {
     connectionStatus,
@@ -1141,7 +514,6 @@ export function useSecureP2PLink() {
     role,
     error,
     activeSignalingBase,
-    networkMode,
     selectedFiles,
     isSending,
     sendProgress,
