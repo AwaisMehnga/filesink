@@ -1,35 +1,76 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import {
-  AlertCircle,
-  Download,
-  FileText,
-  Link2,
-  Share2,
-  Upload,
-  Wifi,
-  WifiOff,
-  X,
-} from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+const DEFAULT_CLOUD_SIGNALING = 'https://speech-to-text.reactssrtest.workers.dev';
 const CHUNK_SIZE = 16 * 1024;
-const BUFFER_LIMIT = CHUNK_SIZE * 32;
+const BUFFER_LIMIT = CHUNK_SIZE * 64;
+const SESSION_STORAGE_KEY = 'secure-p2p-session';
 
-const waitForIceGatheringComplete = (peerConnection) =>
+const waitForIceGatheringComplete = (pc) =>
   new Promise((resolve) => {
-    if (peerConnection.iceGatheringState === 'complete') {
+    if (pc.iceGatheringState === 'complete') {
       resolve();
       return;
     }
 
-    const handleStateChange = () => {
-      if (peerConnection.iceGatheringState === 'complete') {
-        peerConnection.removeEventListener('icegatheringstatechange', handleStateChange);
+    const onChange = () => {
+      if (pc.iceGatheringState === 'complete') {
+        pc.removeEventListener('icegatheringstatechange', onChange);
         resolve();
       }
     };
 
-    peerConnection.addEventListener('icegatheringstatechange', handleStateChange);
+    pc.addEventListener('icegatheringstatechange', onChange);
   });
+
+const parseOfferToken = (offerToken) => {
+  const [sessionId, key] = (offerToken || '').split('.');
+  if (!sessionId || !key) {
+    throw new Error('Invalid offer token.');
+  }
+  return { sessionId, key };
+};
+
+const requestJson = async (url, options = {}, timeoutMs = 8000) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(options.headers || {}),
+      },
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      const message = data.error || `Request failed (${response.status})`;
+      const error = new Error(message);
+      error.status = response.status;
+      throw error;
+    }
+
+    return data;
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const uniqueBases = (bases) => {
+  const seen = new Set();
+  return bases
+    .map((base) => base?.trim())
+    .filter((base) => {
+      if (!base || seen.has(base)) {
+        return false;
+      }
+      seen.add(base);
+      return true;
+    });
+};
 
 const waitForChannelCapacity = (channel) =>
   new Promise((resolve) => {
@@ -38,621 +79,746 @@ const waitForChannelCapacity = (channel) =>
       return;
     }
 
-    const handleBufferedAmountLow = () => {
-      if (channel.bufferedAmount <= BUFFER_LIMIT) {
-        channel.removeEventListener('bufferedamountlow', handleBufferedAmountLow);
-        resolve();
-      }
+    const onLow = () => {
+      channel.removeEventListener('bufferedamountlow', onLow);
+      resolve();
     };
 
-    channel.bufferedAmountLowThreshold = CHUNK_SIZE * 8;
-    channel.addEventListener('bufferedamountlow', handleBufferedAmountLow);
+    channel.bufferedAmountLowThreshold = CHUNK_SIZE * 16;
+    channel.addEventListener('bufferedamountlow', onLow);
   });
 
 const formatSize = (bytes) => {
   if (bytes === 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB'];
-  const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  const size = bytes / 1024 ** exponent;
-  return `${size.toFixed(size >= 10 || exponent === 0 ? 0 : 1)} ${units[exponent]}`;
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / 1024 ** index;
+  return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
 };
 
-const createTransferId = () =>
-  globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+const getStoredSession = () => {
+  try {
+    const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+};
+
+const setStoredSession = (session) => {
+  try {
+    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
+  } catch {
+    // Ignore storage errors.
+  }
+};
 
 function App() {
-  const [activeTab, setActiveTab] = useState('connect');
-  const [connectionState, setConnectionState] = useState('idle');
-  const [statusMessage, setStatusMessage] = useState('Generate a shareable link to connect with another device.');
-  const [error, setError] = useState(null);
+  const [connectionStatus, setConnectionStatus] = useState('Idle');
+  const [connectionDetail, setConnectionDetail] = useState('Create a secure connection URL.');
+  const [shareUrl, setShareUrl] = useState('');
+  const [role, setRole] = useState('host');
+  const [error, setError] = useState('');
+  const [activeSignalingBase, setActiveSignalingBase] = useState('');
+  const [networkMode, setNetworkMode] = useState('internet');
   const [selectedFiles, setSelectedFiles] = useState([]);
-  const [transferProgress, setTransferProgress] = useState(0);
-  const [isTransferring, setIsTransferring] = useState(false);
-  const [currentTransferName, setCurrentTransferName] = useState('');
+  const [isSending, setIsSending] = useState(false);
+  const [sendProgress, setSendProgress] = useState(0);
+  const [currentSendName, setCurrentSendName] = useState('');
+  const [receiveProgress, setReceiveProgress] = useState(0);
+  const [currentReceiveName, setCurrentReceiveName] = useState('');
   const [receivedFiles, setReceivedFiles] = useState([]);
-  const [dragActive, setDragActive] = useState(false);
-
-  // Server and connection states
-  const [serverUrl, setServerUrl] = useState('');
-  const [currentOfferId, setCurrentOfferId] = useState('');
-  const [isPollingAnswer, setIsPollingAnswer] = useState(false);
-  const [shareLink, setShareLink] = useState('');
-  const [isLAN, setIsLAN] = useState(false);
 
   const peerRef = useRef(null);
   const channelRef = useRef(null);
-  const incomingTransferRef = useRef(null);
-  const fileInputRef = useRef(null);
-  const pollIntervalRef = useRef(null);
+  const answerPollRef = useRef(null);
+  const sessionStatusPollRef = useRef(null);
+  const sessionRef = useRef({ sessionId: '', key: '' });
+  const autoJoinRef = useRef('');
+  const incomingFileRef = useRef(null);
 
-  const cleanupPeer = useCallback(() => {
+  const envSignaling = useMemo(() => import.meta.env.VITE_SIGNALING_URL || '', []);
+
+  const cleanupPolling = useCallback(() => {
+    if (answerPollRef.current) {
+      clearInterval(answerPollRef.current);
+      answerPollRef.current = null;
+    }
+
+    if (sessionStatusPollRef.current) {
+      clearInterval(sessionStatusPollRef.current);
+      sessionStatusPollRef.current = null;
+    }
+  }, []);
+
+  const cleanupConnection = useCallback(() => {
+    cleanupPolling();
+    incomingFileRef.current = null;
+
     if (channelRef.current) {
       channelRef.current.onopen = null;
       channelRef.current.onclose = null;
-      channelRef.current.onmessage = null;
       channelRef.current.close();
       channelRef.current = null;
     }
 
     if (peerRef.current) {
-      peerRef.current.ondatachannel = null;
       peerRef.current.onconnectionstatechange = null;
-      peerRef.current.onicecandidate = null;
-      peerRef.current.ontrack = null;
+      peerRef.current.ondatachannel = null;
       peerRef.current.close();
       peerRef.current = null;
     }
-
-    incomingTransferRef.current = null;
-  }, []);
-
-  useEffect(() => () => cleanupPeer(), [cleanupPeer]);
-
-  // Initialize server and handle URL parameters
-  useEffect(() => {
-    const initServer = async () => {
-      // Set up server URL - prefer production
-      const url = import.meta.env.VITE_SERVER_URL || 
-                  (typeof window !== 'undefined' && window.location.origin.includes('pages.dev')
-                    ? window.location.origin.replace(/\.pages\.dev/, '-worker.pages.dev')
-                    : window.location.origin);
-      
-      setServerUrl(url);
-
-      // Check for offer parameter in URL
-      const params = new URLSearchParams(window.location.search);
-      const offerId = params.get('offer');
-      
-      if (offerId) {
-        setCurrentOfferId(offerId);
-        setConnectionState('connecting');
-        setStatusMessage('Loading shared connection...');
-        
-        try {
-          const response = await fetch(`${url}/api/offer/${offerId}`);
-          if (response.ok) {
-            const data = await response.json();
-            setStatusMessage('Creating answer...');
-            await joinOfferLink(offerId, data.offer);
-          } else {
-            setError('Connection expired or invalid. Generate a new link.');
-            setConnectionState('idle');
-          }
-        } catch (err) {
-          setError(`Could not load connection: ${err.message}`);
-          setConnectionState('idle');
-        }
-      }
-    };
-
-    initServer();
-
-    return () => {
-      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-    };
-  }, []);
-
-  const setupDataChannel = useCallback((channel) => {
-    channel.onopen = () => {
-      setConnectionState('connected');
-      setStatusMessage('Connected! Ready to transfer files.');
-      setActiveTab('transfer');
-    };
-
-    channel.onclose = () => {
-      setConnectionState('idle');
-      setStatusMessage('Connection closed.');
-    };
-
-    channel.onmessage = async (event) => {
-      const data = event.data;
-
-      if (typeof data === 'string') {
-        try {
-          const message = JSON.parse(data);
-
-          if (message.type === 'file-start') {
-            incomingTransferRef.current = {
-              transferId: message.transferId,
-              name: message.name,
-              size: message.size,
-              mime: message.mime,
-              chunks: [],
-              receivedBytes: 0,
-            };
-            setCurrentTransferName(message.name);
-            setTransferProgress(0);
-          } else if (message.type === 'file-end') {
-            const transfer = incomingTransferRef.current;
-            if (transfer && transfer.transferId === message.transferId) {
-              const blob = new Blob(transfer.chunks, { type: transfer.mime });
-              const url = URL.createObjectURL(blob);
-              setReceivedFiles((prev) => [...prev, { name: transfer.name, url, size: transfer.size }]);
-              setTransferProgress(0);
-              setCurrentTransferName('');
-              incomingTransferRef.current = null;
-            }
-          }
-        } catch (err) {
-          console.error('Failed to parse message:', err);
-        }
-        return;
-      }
-
-      const transfer = incomingTransferRef.current;
-      if (!transfer) return;
-
-      transfer.chunks.push(new Uint8Array(data));
-      transfer.receivedBytes += data.byteLength;
-      setTransferProgress(Math.min(100, Math.floor((transfer.receivedBytes / transfer.size) * 100)));
-    };
-
-    channelRef.current = channel;
-  }, []);
-
-  const setupPeerConnection = useCallback(() => {
-    const peer = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-      ],
-    });
-
-    peer.onconnectionstatechange = () => {
-      if (peer.connectionState === 'failed') {
-        setError('Connection failed. Check your network.');
-        setConnectionState('idle');
-        cleanupPeer();
-      }
-    };
-
-    peer.onicecandidate = () => {};
-    peer.ontrack = () => {};
-    peerRef.current = peer;
-    return peer;
-  }, [cleanupPeer]);
-
-  const updateConnectionState = useCallback((nextState, message) => {
-    setConnectionState(nextState);
-    if (message) setStatusMessage(message);
-    if (nextState === 'connected') setActiveTab('transfer');
-  }, []);
-
-  const createOfferLink = useCallback(async () => {
-    try {
-      setError(null);
-      setStatusMessage('Creating link...');
-      setConnectionState('connecting');
-      setShareLink('');
-      setIsLAN(false);
-
-      const peer = setupPeerConnection();
-      const channel = peer.createDataChannel('file-transfer', { ordered: true });
-      setupDataChannel(channel);
-
-      const offer = await peer.createOffer();
-      await peer.setLocalDescription(offer);
-      await waitForIceGatheringComplete(peer);
-
-      const response = await fetch(`${serverUrl}/api/offer`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ offer: peer.localDescription }),
-      });
-
-      if (!response.ok) throw new Error('Failed to create link');
-      
-      const { offerId, link } = await response.json();
-      setCurrentOfferId(offerId);
-      setShareLink(link);
-      setStatusMessage('Link created! Share it with another device.');
-      updateConnectionState('awaiting-peer');
-      
-      pollForAnswer(offerId);
-    } catch (err) {
-      setError(`Failed to create link: ${err.message}`);
-      updateConnectionState('idle');
-    }
-  }, [serverUrl, setupPeerConnection, setupDataChannel, updateConnectionState]);
-
-  const joinOfferLink = useCallback(async (offerId, offerDescription) => {
-    try {
-      setError(null);
-      setConnectionState('connecting');
-
-      const peer = setupPeerConnection();
-      await peer.setRemoteDescription(offerDescription);
-
-      const answer = await peer.createAnswer();
-      await peer.setLocalDescription(answer);
-      await waitForIceGatheringComplete(peer);
-
-      const response = await fetch(`${serverUrl}/api/answer/${offerId}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ answer: peer.localDescription }),
-      });
-
-      if (!response.ok) throw new Error('Failed to send answer');
-      setStatusMessage('Connected!');
-      updateConnectionState('connected');
-    } catch (err) {
-      setError(`Could not join: ${err.message}`);
-      updateConnectionState('idle');
-    }
-  }, [serverUrl, setupPeerConnection, updateConnectionState]);
-
-  const pollForAnswer = (offerId) => {
-    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-    setIsPollingAnswer(true);
-
-    const pollInterval = setInterval(async () => {
-      try {
-        const response = await fetch(`${serverUrl}/api/answer/${offerId}`);
-
-        if (response.ok) {
-          const data = await response.json();
-          clearInterval(pollInterval);
-          setIsPollingAnswer(false);
-
-          if (!peerRef.current) throw new Error('Peer connection lost');
-          await peerRef.current.setRemoteDescription(data.answer);
-          setStatusMessage('Connected!');
-          updateConnectionState('connected');
-        }
-      } catch (err) {
-        console.log('Waiting for peer...');
-      }
-    }, 1000);
-
-    pollIntervalRef.current = pollInterval;
-  };
-
-  const resetSession = useCallback(() => {
-    cleanupPeer();
-    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-    
-    setConnectionState('idle');
-    setStatusMessage('Generate a shareable link to connect with another device.');
-    setError(null);
-    setSelectedFiles([]);
-    setTransferProgress(0);
-    setIsTransferring(false);
-    setCurrentTransferName('');
-    setCurrentOfferId('');
-    setIsPollingAnswer(false);
-    setShareLink('');
-  }, [cleanupPeer]);
-
-  const handleFileSelect = useCallback((files) => {
-    setSelectedFiles(Array.from(files));
-  }, []);
+  }, [cleanupPolling]);
 
   const sendSelectedFiles = useCallback(async () => {
-    const channel = channelRef.current;
-
-    if (!channel || channel.readyState !== 'open' || selectedFiles.length === 0) {
+    if (!channelRef.current || channelRef.current.readyState !== 'open') {
+      setError('Channel is not open. Reconnect and try again.');
       return;
     }
 
+    if (!selectedFiles.length) {
+      return;
+    }
+
+    setError('');
+    setIsSending(true);
+
     try {
-      setError(null);
-      setIsTransferring(true);
-      setTransferProgress(0);
-
-      const totalBytes = selectedFiles.reduce((total, file) => total + file.size, 0) || 1;
-      let sentBytes = 0;
-
       for (const file of selectedFiles) {
-        const transferId = createTransferId();
-        setCurrentTransferName(file.name);
-        channel.send(
+        const transferId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+        const total = file.size;
+        let sent = 0;
+
+        setCurrentSendName(file.name);
+        setSendProgress(0);
+
+        channelRef.current.send(
           JSON.stringify({
-            type: 'file-start',
+            type: 'file-meta',
             transferId,
             name: file.name,
             size: file.size,
-            mime: file.type,
-          })
+            mime: file.type || 'application/octet-stream',
+          }),
         );
 
-        const buffer = await file.arrayBuffer();
-        let offset = 0;
+        while (sent < total) {
+          const chunk = file.slice(sent, sent + CHUNK_SIZE);
+          const bytes = await chunk.arrayBuffer();
+          channelRef.current.send(bytes);
 
-        while (offset < buffer.byteLength) {
-          await waitForChannelCapacity(channel);
-          const chunk = buffer.slice(offset, offset + CHUNK_SIZE);
-          channel.send(chunk);
-          offset += chunk.byteLength;
-          sentBytes += chunk.byteLength;
-          setTransferProgress(Math.min(100, Math.floor((sentBytes / totalBytes) * 100)));
+          sent += bytes.byteLength;
+          setSendProgress(Math.floor((sent / total) * 100));
+
+          if (channelRef.current.bufferedAmount > BUFFER_LIMIT) {
+            await waitForChannelCapacity(channelRef.current);
+          }
         }
 
-        channel.send(JSON.stringify({ type: 'file-end', transferId }));
+        channelRef.current.send(JSON.stringify({ type: 'file-end', transferId }));
       }
 
-      setStatusMessage(`Sent ${selectedFiles.length} file${selectedFiles.length === 1 ? '' : 's'}.`);
       setSelectedFiles([]);
+      setCurrentSendName('');
+      setSendProgress(0);
     } catch (err) {
-      setError(`Transfer failed: ${err.message}`);
+      setError(err.message || 'File send failed.');
     } finally {
-      setIsTransferring(false);
+      setIsSending(false);
     }
   }, [selectedFiles]);
 
-  const downloadFile = (file) => {
-    const a = document.createElement('a');
-    a.href = file.url;
-    a.download = file.name;
-    a.click();
-  };
+  const buildIceServers = useCallback(() => {
+    const servers = [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+    ];
 
-  const copyToClipboard = (text) => {
-    navigator.clipboard.writeText(text);
-  };
+    if (import.meta.env.VITE_TURN_URL && import.meta.env.VITE_TURN_USERNAME && import.meta.env.VITE_TURN_CREDENTIAL) {
+      servers.push({
+        urls: import.meta.env.VITE_TURN_URL,
+        username: import.meta.env.VITE_TURN_USERNAME,
+        credential: import.meta.env.VITE_TURN_CREDENTIAL,
+      });
+    }
+
+    return servers;
+  }, []);
+
+  const setupPeer = useCallback(() => {
+    const pc = new RTCPeerConnection({
+      iceServers: buildIceServers(),
+    });
+
+    pc.onconnectionstatechange = () => {
+      const state = pc.connectionState;
+
+      if (state === 'connected') {
+        cleanupPolling();
+        setConnectionStatus('Connected');
+        setConnectionDetail('Direct secure WebRTC tunnel established.');
+      } else if (state === 'connecting') {
+        setConnectionStatus('Connecting');
+        setConnectionDetail('Negotiating secure peer channel...');
+      } else if (state === 'failed') {
+        setConnectionStatus('Failed');
+        setConnectionDetail('Connection failed. Check network or TURN setup.');
+      } else if (state === 'disconnected' || state === 'closed') {
+        setConnectionStatus('Closed');
+        setConnectionDetail('Peer disconnected.');
+      }
+    };
+
+    peerRef.current = pc;
+    return pc;
+  }, [buildIceServers, cleanupPolling]);
+
+  const startStatusPolling = useCallback((base, sessionId, key) => {
+    sessionStatusPollRef.current = setInterval(async () => {
+      try {
+        const data = await requestJson(`${base}/api/session/${sessionId}/status?key=${encodeURIComponent(key)}`, {}, 4000);
+        if (data.status === 'joined') {
+          setConnectionStatus('Peer Joined');
+          setConnectionDetail('Peer opened your URL and is creating answer.');
+        }
+      } catch {
+        // Ignore transient polling errors.
+      }
+    }, 1500);
+  }, []);
+
+  const beginHostAnswerPolling = useCallback((base, sessionId, key) => {
+    answerPollRef.current = setInterval(async () => {
+      if (!peerRef.current) {
+        return;
+      }
+
+      try {
+        const response = await fetch(`${base}/api/session/${sessionId}/answer?key=${encodeURIComponent(key)}`);
+        if (response.status === 202) {
+          return;
+        }
+
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || 'Unable to fetch answer');
+        }
+
+          if (data.answer && peerRef.current.signalingState !== 'closed') {
+          clearInterval(answerPollRef.current);
+          answerPollRef.current = null;
+          await peerRef.current.setRemoteDescription(data.answer);
+            setConnectionStatus('Peer Connected');
+            setConnectionDetail('Peer answer accepted. Finalizing encrypted data channel.');
+        }
+      } catch {
+        // Ignore transient polling errors.
+      }
+    }, 1000);
+  }, []);
+
+  const setSecureChannelHandlers = useCallback(() => {
+    if (!channelRef.current) {
+      return;
+    }
+
+    channelRef.current.binaryType = 'arraybuffer';
+
+    channelRef.current.onopen = () => {
+      cleanupPolling();
+      setConnectionStatus('Connected');
+      setConnectionDetail('Secure data channel open (DTLS encrypted).');
+
+      try {
+        channelRef.current.send(JSON.stringify({ type: 'peer-ready', at: Date.now() }));
+      } catch {
+        // Ignore transient send errors.
+      }
+    };
+
+    channelRef.current.onclose = () => {
+      setConnectionStatus('Closed');
+      setConnectionDetail('Secure channel closed.');
+    };
+
+    channelRef.current.onmessage = async (event) => {
+      if (typeof event.data === 'string') {
+        try {
+          const message = JSON.parse(event.data);
+
+          if (message?.type === 'peer-ready') {
+            cleanupPolling();
+            setConnectionStatus('Connected');
+            setConnectionDetail('Peer is connected and ready.');
+            return;
+          }
+
+          if (message?.type === 'file-meta') {
+            incomingFileRef.current = {
+              transferId: message.transferId,
+              name: message.name,
+              size: message.size,
+              mime: message.mime || 'application/octet-stream',
+              chunks: [],
+              received: 0,
+            };
+            setCurrentReceiveName(message.name);
+            setReceiveProgress(0);
+            return;
+          }
+
+          if (message?.type === 'file-end' && incomingFileRef.current?.transferId === message.transferId) {
+            const transfer = incomingFileRef.current;
+            const blob = new Blob(transfer.chunks, { type: transfer.mime });
+            const url = URL.createObjectURL(blob);
+
+            setReceivedFiles((prev) => [
+              ...prev,
+              {
+                id: transfer.transferId,
+                name: transfer.name,
+                size: transfer.size,
+                url,
+              },
+            ]);
+
+            incomingFileRef.current = null;
+            setCurrentReceiveName('');
+            setReceiveProgress(0);
+          }
+        } catch {
+          // Ignore non-control messages.
+        }
+
+        return;
+      }
+
+      if (!incomingFileRef.current) {
+        return;
+      }
+
+      let bytes = event.data;
+      if (event.data instanceof Blob) {
+        bytes = await event.data.arrayBuffer();
+      }
+
+      if (!(bytes instanceof ArrayBuffer)) {
+        return;
+      }
+
+      incomingFileRef.current.chunks.push(bytes);
+      incomingFileRef.current.received += bytes.byteLength;
+      setReceiveProgress(Math.floor((incomingFileRef.current.received / incomingFileRef.current.size) * 100));
+    };
+  }, [cleanupPolling]);
+
+  const getHostSignalingCandidates = useCallback(() => {
+    return uniqueBases([
+      'http://localhost:3000',
+      envSignaling,
+      DEFAULT_CLOUD_SIGNALING,
+    ]);
+  }, [envSignaling]);
+
+  const getJoinSignalingCandidates = useCallback((sigHint) => {
+    return uniqueBases([
+      sigHint,
+      envSignaling,
+      'http://localhost:3000',
+      DEFAULT_CLOUD_SIGNALING,
+    ]);
+  }, [envSignaling]);
+
+  const buildShareUrl = useCallback((offerToken, signalingBase, localIP = '') => {
+    const params = new URLSearchParams({ offer: offerToken });
+    if (signalingBase === 'http://localhost:3000' && localIP) {
+      params.set('sig', `http://${localIP}:3000`);
+    }
+    return `${window.location.origin}/?${params.toString()}`;
+  }, []);
+
+  const resumeHostSession = useCallback(async (stored) => {
+    const { offerToken, signalingBase: storedBase, networkMode: storedMode } = stored || {};
+    if (!offerToken || !storedBase) {
+      throw new Error('No stored host session found.');
+    }
+
+    const { sessionId, key } = parseOfferToken(offerToken);
+    const candidates = uniqueBases([storedBase, 'http://localhost:3000', envSignaling, DEFAULT_CLOUD_SIGNALING]);
+
+    cleanupConnection();
+    setRole('host');
+    setError('');
+    setConnectionStatus('Reconnecting');
+    setConnectionDetail('Restoring host session after reload...');
+
+    const pc = setupPeer();
+    const channel = pc.createDataChannel('secure-link', { ordered: true });
+    channelRef.current = channel;
+    setSecureChannelHandlers();
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await waitForIceGatheringComplete(pc);
+
+    let selectedBase = '';
+    let updateResult = null;
+
+    for (const base of candidates) {
+      try {
+        const data = await requestJson(
+          `${base}/api/session/${sessionId}/offer?key=${encodeURIComponent(key)}`,
+          {
+            method: 'PUT',
+            body: JSON.stringify({ offer: pc.localDescription }),
+          },
+          5000,
+        );
+        selectedBase = base;
+        updateResult = data;
+        break;
+      } catch {
+        // Try next signaling endpoint.
+      }
+    }
+
+    if (!selectedBase || !updateResult) {
+      throw new Error('Failed to restore host session. Generate a new URL.');
+    }
+
+    sessionRef.current = { sessionId, key };
+    setActiveSignalingBase(selectedBase);
+
+    const mode = storedMode || (selectedBase === 'http://localhost:3000' ? 'lan' : 'internet');
+    setNetworkMode(mode);
+
+    const shareUrl = buildShareUrl(offerToken, selectedBase, updateResult.localIP || '');
+    setShareUrl(shareUrl);
+
+    setStoredSession({
+      offerToken,
+      role: 'host',
+      signalingBase: selectedBase,
+      networkMode: mode,
+      sigHint: selectedBase === 'http://localhost:3000' && updateResult.localIP ? `http://${updateResult.localIP}:3000` : '',
+    });
+
+    setConnectionStatus('Awaiting Peer');
+    setConnectionDetail('Session restored. Waiting for peer to reconnect.');
+
+    startStatusPolling(selectedBase, sessionId, key);
+    beginHostAnswerPolling(selectedBase, sessionId, key);
+  }, [
+    beginHostAnswerPolling,
+    buildShareUrl,
+    cleanupConnection,
+    envSignaling,
+    setSecureChannelHandlers,
+    setupPeer,
+    startStatusPolling,
+  ]);
+
+  const createConnectionUrl = useCallback(async () => {
+    try {
+      setError('');
+      setRole('host');
+      setShareUrl('');
+      cleanupConnection();
+      setConnectionStatus('Creating Offer');
+      setConnectionDetail('Preparing secure WebRTC offer...');
+
+      const pc = setupPeer();
+      const channel = pc.createDataChannel('secure-link', { ordered: true });
+      channelRef.current = channel;
+      setSecureChannelHandlers();
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitForIceGatheringComplete(pc);
+
+      const candidates = getHostSignalingCandidates();
+      let createdSession = null;
+      let selectedBase = '';
+
+      for (const base of candidates) {
+        try {
+          const data = await requestJson(
+            `${base}/api/session`,
+            {
+              method: 'POST',
+              body: JSON.stringify({ offer: pc.localDescription }),
+            },
+            5000,
+          );
+
+          createdSession = data;
+          selectedBase = base;
+          break;
+        } catch {
+          // Try the next signaling endpoint.
+        }
+      }
+
+      if (!createdSession || !selectedBase) {
+        throw new Error('Unable to reach signaling server');
+      }
+
+      const { sessionId, key } = parseOfferToken(createdSession.offerToken);
+      sessionRef.current = { sessionId, key };
+      setActiveSignalingBase(selectedBase);
+
+      const params = new URLSearchParams({
+        offer: createdSession.offerToken,
+      });
+
+      if (selectedBase === 'http://localhost:3000' && createdSession.localIP) {
+        params.set('sig', `http://${createdSession.localIP}:3000`);
+        setNetworkMode('lan');
+      } else {
+        setNetworkMode('internet');
+      }
+
+      const url = `${window.location.origin}/?${params.toString()}`;
+      setShareUrl(url);
+
+      const persistedSigHint = selectedBase === 'http://localhost:3000' && createdSession.localIP ? `http://${createdSession.localIP}:3000` : '';
+      setStoredSession({
+        offerToken: createdSession.offerToken,
+        role: 'host',
+        signalingBase: selectedBase,
+        networkMode: selectedBase === 'http://localhost:3000' ? 'lan' : 'internet',
+        sigHint: persistedSigHint,
+      });
+
+      setConnectionStatus('Awaiting Peer');
+      setConnectionDetail('Share URL with one peer. Session expires automatically.');
+
+      startStatusPolling(selectedBase, sessionId, key);
+      beginHostAnswerPolling(selectedBase, sessionId, key);
+    } catch (err) {
+      setError(err.message || 'Failed to generate URL');
+      setConnectionStatus('Idle');
+      setConnectionDetail('Try generating a new URL.');
+    }
+  }, [
+    beginHostAnswerPolling,
+    cleanupConnection,
+    getHostSignalingCandidates,
+    setSecureChannelHandlers,
+    setupPeer,
+    startStatusPolling,
+  ]);
+
+  const joinFromOfferToken = useCallback(
+    async (offerToken, sigHint) => {
+      try {
+        setError('');
+        setRole('peer');
+        cleanupConnection();
+        setConnectionStatus('Joining');
+        setConnectionDetail('Loading secure offer from signaling service...');
+
+        const { sessionId, key } = parseOfferToken(offerToken);
+        sessionRef.current = { sessionId, key };
+
+        const candidates = getJoinSignalingCandidates(sigHint);
+        let sessionData = null;
+        let selectedBase = '';
+
+        let lastError = null;
+
+        for (const base of candidates) {
+          try {
+            const data = await requestJson(`${base}/api/session/${sessionId}?key=${encodeURIComponent(key)}`, {}, 5000);
+            sessionData = data;
+            selectedBase = base;
+            break;
+          } catch (err) {
+            lastError = err;
+            // If the endpoint confirms the session exists but is already used/blocked,
+            // stop fallback to avoid leaking into unrelated endpoints.
+            if (err?.status && err.status !== 404) {
+              break;
+            }
+          }
+        }
+
+        if (!sessionData || !selectedBase) {
+          throw lastError || new Error('Offer was not found, expired, or already used');
+        }
+
+        setActiveSignalingBase(selectedBase);
+        setNetworkMode(selectedBase.startsWith('http://192.') || selectedBase.startsWith('http://10.') ? 'lan' : 'internet');
+
+        setStoredSession({
+          offerToken,
+          role: 'peer',
+          signalingBase: selectedBase,
+          networkMode: selectedBase.startsWith('http://192.') || selectedBase.startsWith('http://10.') ? 'lan' : 'internet',
+          sigHint,
+        });
+
+        const pc = setupPeer();
+        pc.ondatachannel = (event) => {
+          channelRef.current = event.channel;
+          setSecureChannelHandlers();
+        };
+
+        await pc.setRemoteDescription(sessionData.offer);
+
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        await waitForIceGatheringComplete(pc);
+
+        await requestJson(
+          `${selectedBase}/api/session/${sessionId}/answer?key=${encodeURIComponent(key)}`,
+          {
+            method: 'POST',
+            body: JSON.stringify({ answer: pc.localDescription }),
+          },
+          5000,
+        );
+
+        setConnectionStatus('Answer Sent');
+        setConnectionDetail('Waiting for host to finalize secure connection.');
+      } catch (err) {
+        setError(err.message || 'Failed to join connection');
+        setConnectionStatus('Idle');
+        setConnectionDetail('Open a valid URL and try again.');
+      }
+    },
+    [cleanupConnection, getJoinSignalingCandidates, setSecureChannelHandlers, setupPeer],
+  );
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const offer = params.get('offer');
+    const sig = params.get('sig');
+
+    if (offer) {
+      if (autoJoinRef.current === offer) {
+        return () => {
+          cleanupConnection();
+        };
+      }
+
+      autoJoinRef.current = offer;
+      queueMicrotask(() => {
+        joinFromOfferToken(offer, sig || '');
+      });
+      return () => {
+        cleanupConnection();
+      };
+    }
+
+    const stored = getStoredSession();
+    if (stored?.offerToken && stored?.role === 'host') {
+      queueMicrotask(() => {
+        resumeHostSession(stored).catch((err) => {
+          setError(err.message || 'Could not restore host session.');
+        });
+      });
+    }
+
+    if (stored?.offerToken && stored?.role === 'peer') {
+      queueMicrotask(() => {
+        joinFromOfferToken(stored.offerToken, stored.sigHint || stored.signalingBase || '').catch(() => {
+          // Error is handled inside joinFromOfferToken.
+        });
+      });
+    }
+
+    return () => {
+      cleanupConnection();
+    };
+  }, [cleanupConnection, joinFromOfferToken, resumeHostSession]);
+
+  const showTransferScreen = connectionStatus === 'Connected';
 
   return (
-    <div
-      className="min-h-screen bg-slate-950 text-white overflow-hidden"
-      style={{
-        background:
-          'radial-gradient(circle at top left, rgba(45,212,191,0.18), transparent 28%), radial-gradient(circle at top right, rgba(251,191,36,0.12), transparent 30%), linear-gradient(180deg, #050b13 0%, #091423 45%, #04070d 100%)',
-      }}
-    >
-      <div
-        className="pointer-events-none fixed inset-0 -z-10 opacity-[0.06]"
-        style={{
-          backgroundImage:
-            'linear-gradient(rgba(255,255,255,0.8) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.8) 1px, transparent 1px)',
-          backgroundSize: '48px 48px',
-        }}
-      />
+    <main className="app-shell">
+      <section className="card">
+        {!showTransferScreen ? (
+          <>
+            <h1>Secure P2P Link</h1>
 
-      <header className="sticky top-0 z-20 border-b border-white/10 bg-slate-950/55 backdrop-blur-xl">
-        <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-4 md:px-8">
-          <div className="flex items-center gap-3">
-            <div className="flex h-11 w-11 items-center justify-center rounded-2xl border border-white/10 bg-white/10 shadow-[0_12px_48px_rgba(20,184,166,0.25)]">
-              <Share2 size={22} className="text-cyan-300" />
-            </div>
-            <div>
-              <h1 className="text-lg font-semibold tracking-[0.18em] text-white uppercase">PeerWire</h1>
-              <p className="text-xs text-slate-400">Direct P2P file transfer</p>
-            </div>
-          </div>
-
-          <div className={`flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-semibold ${
-            connectionState === 'connected' ? 'bg-emerald-400/20 text-emerald-300' :
-            connectionState === 'awaiting-peer' ? 'bg-cyan-400/20 text-cyan-300' :
-            'bg-slate-700/50 text-slate-300'
-          }`}>
-            {connectionState === 'connected' && <Wifi size={14} />}
-            {connectionState !== 'idle' && <div className="h-2 w-2 rounded-full bg-current animate-pulse" />}
-            {connectionState.replace('-', ' ').toUpperCase()}
-          </div>
-        </div>
-      </header>
-
-      <main className="mx-auto max-w-6xl px-4 py-8 md:px-8 md:py-10">
-        {error && (
-          <div className="mb-6 flex items-start gap-3 rounded-2xl border border-rose-400/20 bg-rose-500/10 p-4 text-rose-100">
-            <AlertCircle size={18} className="mt-0.5 shrink-0" />
-            <p className="flex-1 text-sm">{error}</p>
-            <button onClick={() => setError(null)} className="rounded-lg p-1 hover:bg-white/10">
-              <X size={16} />
-            </button>
-          </div>
-        )}
-
-        <div className="mb-8 flex flex-wrap justify-center gap-3">
-          <button
-            onClick={() => setActiveTab('connect')}
-            className={`rounded-full px-5 py-2 text-sm font-semibold transition ${
-              activeTab === 'connect'
-                ? 'bg-cyan-300 text-slate-950'
-                : 'border border-white/10 bg-white/5 text-slate-200 hover:bg-white/10'
-            }`}
-          >
-            <Link2 size={16} className="mr-2 inline" />
-            Connect
-          </button>
-          <button
-            onClick={() => setActiveTab('transfer')}
-            className={`rounded-full px-5 py-2 text-sm font-semibold transition ${
-              activeTab === 'transfer'
-                ? 'bg-cyan-300 text-slate-950'
-                : 'border border-white/10 bg-white/5 text-slate-200 hover:bg-white/10'
-            }`}
-          >
-            <Upload size={16} className="mr-2 inline" />
-            Transfer
-          </button>
-          <button
-            onClick={resetSession}
-            className="rounded-full border border-white/10 bg-white/5 px-5 py-2 text-sm font-semibold text-slate-200 transition hover:bg-white/10"
-          >
-            Reset
-          </button>
-        </div>
-
-        {activeTab === 'connect' && (
-          <div className="space-y-6">
-            <div className="rounded-4xl border border-white/10 bg-white/5 p-6 shadow-[0_24px_80px_rgba(0,0,0,0.3)] backdrop-blur-xl md:p-8">
-              <div className="flex items-center gap-3 mb-6">
-                <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-cyan-300 text-slate-950">
-                  1
-                </div>
-                <h3 className="text-xl font-semibold text-white">Generate Link</h3>
-              </div>
-
-              <button
-                onClick={createOfferLink}
-                disabled={connectionState === 'connecting'}
-                className="flex w-full items-center justify-center gap-2 rounded-2xl bg-cyan-300 px-4 py-4 font-semibold text-slate-950 transition hover:bg-cyan-200 disabled:cursor-not-allowed disabled:bg-slate-500 disabled:text-slate-300"
-              >
-                <Link2 size={18} />
-                Create Shareable Link
+            {role === 'host' && (
+              <button type="button" className="primary-btn" onClick={createConnectionUrl}>
+                Generate URL
               </button>
+            )}
 
-              {shareLink && (
-                <div className="mt-6 rounded-2xl border border-cyan-400/30 bg-cyan-500/10 p-4">
-                  <div className="mb-3 flex items-center justify-between">
-                    <label className="text-xs font-semibold uppercase tracking-wider text-cyan-300">
-                      Share this link
-                    </label>
-                    {isPollingAnswer && <span className="text-xs text-cyan-300 animate-pulse">Waiting...</span>}
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="text"
-                      readOnly
-                      value={shareLink}
-                      className="flex-1 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs text-slate-100 outline-none"
-                    />
-                    <button
-                      onClick={() => copyToClipboard(shareLink)}
-                      className="rounded-lg bg-cyan-400/20 px-3 py-2 font-semibold text-cyan-300 transition hover:bg-cyan-400/30"
-                    >
-                      Copy
-                    </button>
-                  </div>
-                </div>
-              )}
+            {shareUrl && (
+              <textarea
+                className="share-url"
+                readOnly
+                value={shareUrl}
+                aria-label="Generated secure URL"
+              />
+            )}
 
-              <div className="mt-6 rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-300">
-                <p className="font-semibold text-white mb-2">How it works:</p>
-                <ul className="space-y-2 text-xs">
-                  <li>✓ Same WiFi: Direct fast LAN connection</li>
-                  <li>✓ Different networks: Secure internet connection</li>
-                  <li>✓ No server storage: True P2P</li>
-                </ul>
+            <p>Status: {connectionStatus}</p>
+            <p>{connectionDetail}</p>
+
+            {activeSignalingBase && <p>Signaling: {activeSignalingBase}</p>}
+            <p>Mode: {networkMode.toUpperCase()}</p>
+
+            {error && <p className="error">Error: {error}</p>}
+          </>
+        ) : (
+          <>
+            <h1>File Transfer</h1>
+            <p>Connection is secure and ready.</p>
+
+            <label className="file-picker" htmlFor="file-input">
+              Choose files
+            </label>
+            <input
+              id="file-input"
+              type="file"
+              multiple
+              onChange={(event) => {
+                const files = Array.from(event.target.files || []);
+                setSelectedFiles(files);
+              }}
+            />
+
+            {selectedFiles.length > 0 && (
+              <div className="list-block">
+                {selectedFiles.map((file) => (
+                  <p key={`${file.name}-${file.size}`}>{file.name} ({formatSize(file.size)})</p>
+                ))}
               </div>
-            </div>
-          </div>
-        )}
+            )}
 
-        {activeTab === 'transfer' && (
-          <div className="grid gap-6 lg:grid-cols-2">
-            {/* Send Files */}
-            <div className="rounded-4xl border border-white/10 bg-white/5 p-6 shadow-[0_24px_80px_rgba(0,0,0,0.3)] backdrop-blur-xl md:p-8">
-              <h3 className="text-xl font-semibold text-white mb-6">Send Files</h3>
+            <button type="button" className="primary-btn" disabled={!selectedFiles.length || isSending} onClick={sendSelectedFiles}>
+              {isSending ? 'Sending...' : 'Send files'}
+            </button>
 
-              <div
-                onDragEnter={() => setDragActive(true)}
-                onDragLeave={() => setDragActive(false)}
-                onDragOver={(e) => e.preventDefault()}
-                onDrop={(e) => {
-                  e.preventDefault();
-                  setDragActive(false);
-                  handleFileSelect(e.dataTransfer.files);
-                }}
-                className={`relative rounded-3xl border-2 border-dashed transition ${
-                  dragActive ? 'border-cyan-300 bg-cyan-500/10' : 'border-white/20 bg-white/5'
-                }`}
-              >
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  multiple
-                  onChange={(e) => handleFileSelect(e.target.files ?? [])}
-                  className="absolute inset-0 cursor-pointer opacity-0"
-                />
-                <div className="flex min-h-64 flex-col items-center justify-center p-8 text-center">
-                  <Upload size={40} className="mb-3 text-cyan-300/50" />
-                  <p className="text-sm font-semibold text-white">Drag files here or click to select</p>
-                  <p className="text-xs text-slate-400 mt-2">Multiple files supported</p>
-                </div>
+            {isSending && <p>Sending {currentSendName} - {sendProgress}%</p>}
+            {currentReceiveName && <p>Receiving {currentReceiveName} - {receiveProgress}%</p>}
+
+            <h2>Received files</h2>
+            {receivedFiles.length > 0 ? (
+              <div className="list-block">
+                {receivedFiles.map((file) => (
+                  <a key={file.id} href={file.url} download={file.name}>
+                    {file.name} ({formatSize(file.size)})
+                  </a>
+                ))}
               </div>
+            ) : (
+              <p>No files received yet.</p>
+            )}
 
-              {selectedFiles.length > 0 && (
-                <div className="mt-6 space-y-3">
-                  {selectedFiles.map((file, idx) => (
-                    <div
-                      key={idx}
-                      className="flex items-center justify-between rounded-lg border border-white/10 bg-white/5 p-3"
-                    >
-                      <div className="flex items-center gap-3 flex-1">
-                        <FileText size={18} className="text-cyan-300 shrink-0" />
-                        <div className="flex-1 overflow-hidden">
-                          <p className="text-sm font-semibold text-white truncate">{file.name}</p>
-                          <p className="text-xs text-slate-400">{formatSize(file.size)}</p>
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-
-                  <button
-                    onClick={sendSelectedFiles}
-                    disabled={connectionState !== 'connected' || isTransferring}
-                    className="w-full rounded-2xl bg-emerald-400 px-4 py-3 font-semibold text-slate-950 transition hover:bg-emerald-300 disabled:cursor-not-allowed disabled:bg-slate-500 disabled:text-slate-300"
-                  >
-                    {isTransferring ? `Sending... ${transferProgress}%` : 'Send Files'}
-                  </button>
-                </div>
-              )}
-            </div>
-
-            {/* Receive Files */}
-            <div className="rounded-4xl border border-white/10 bg-white/5 p-6 shadow-[0_24px_80px_rgba(0,0,0,0.3)] backdrop-blur-xl md:p-8">
-              <h3 className="text-xl font-semibold text-white mb-6">Received Files</h3>
-
-              {receivedFiles.length === 0 ? (
-                <div className="flex min-h-64 flex-col items-center justify-center rounded-3xl border border-dashed border-white/10 text-center">
-                  <Download size={40} className="mb-3 text-slate-400/50" />
-                  <p className="text-sm text-slate-400">Files will appear here when received</p>
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  {receivedFiles.map((file, idx) => (
-                    <div
-                      key={idx}
-                      className="flex items-center justify-between rounded-lg border border-white/10 bg-white/5 p-3"
-                    >
-                      <div className="flex items-center gap-3 flex-1">
-                        <FileText size={18} className="text-emerald-300 shrink-0" />
-                        <div className="flex-1 overflow-hidden">
-                          <p className="text-sm font-semibold text-white truncate">{file.name}</p>
-                          <p className="text-xs text-slate-400">{formatSize(file.size)}</p>
-                        </div>
-                      </div>
-                      <button
-                        onClick={() => downloadFile(file)}
-                        className="rounded-lg bg-emerald-400/20 p-2 text-emerald-300 transition hover:bg-emerald-400/30"
-                      >
-                        <Download size={18} />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
+            <p>Status: {connectionStatus}</p>
+            <p>Mode: {networkMode.toUpperCase()}</p>
+            {error && <p className="error">Error: {error}</p>}
+          </>
         )}
-
-        <div className="mt-12 rounded-2xl border border-white/10 bg-white/5 p-6 text-center text-sm text-slate-400">
-          <p>Your data stays between you. No files pass through any server.</p>
-        </div>
-      </main>
-    </div>
+      </section>
+    </main>
   );
 }
 

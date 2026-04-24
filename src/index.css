@@ -1,49 +1,72 @@
-@import "tailwindcss";
-
 :root {
-	color-scheme: dark;
-	font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-	background: #04070d;
-	color: #e2e8f0;
+  font-family: sans-serif;
 }
 
 html,
 body,
 #root {
-	min-height: 100%;
+  width: 100%;
+  height: 100%;
+  margin: 0;
 }
 
-body {
-	margin: 0;
-	background:
-		radial-gradient(circle at top left, rgba(45, 212, 191, 0.15), transparent 28%),
-		radial-gradient(circle at top right, rgba(251, 191, 36, 0.1), transparent 32%),
-		linear-gradient(180deg, #050b13 0%, #091423 45%, #04070d 100%);
-	color: #e2e8f0;
-	text-rendering: optimizeLegibility;
-	-webkit-font-smoothing: antialiased;
-	-moz-osx-font-smoothing: grayscale;
+.app-shell {
+  width: 100%;
+  min-height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #f3f4f6;
 }
 
-::selection {
-	background: rgba(34, 211, 238, 0.28);
-	color: #fff;
+.card {
+  width: min(680px, 92vw);
+  padding: 24px;
+  border-radius: 12px;
+  background: #ffffff;
+  border: 1px solid #d1d5db;
+  display: grid;
+  gap: 12px;
 }
 
-.custom-scrollbar::-webkit-scrollbar {
-	width: 6px;
-	height: 6px;
+.primary-btn {
+  justify-self: center;
+  padding: 12px 18px;
+  border-radius: 10px;
+  border: 1px solid #111827;
+  background: #111827;
+  color: #ffffff;
+  cursor: pointer;
 }
 
-.custom-scrollbar::-webkit-scrollbar-track {
-	background: transparent;
+.share-url {
+  width: 100%;
+  min-height: 88px;
+  resize: vertical;
 }
 
-.custom-scrollbar::-webkit-scrollbar-thumb {
-	background: rgba(148, 163, 184, 0.35);
-	border-radius: 999px;
+.error {
+  color: #b91c1c;
 }
 
-.custom-scrollbar::-webkit-scrollbar-thumb:hover {
-	background: rgba(148, 163, 184, 0.55);
+.file-picker {
+  display: inline-block;
+  width: fit-content;
+  padding: 8px 12px;
+  border: 1px solid #111827;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+#file-input {
+  display: none;
+}
+
+.list-block {
+  display: grid;
+  gap: 6px;
+}
+
+.list-block a {
+  color: #1d4ed8;
 }

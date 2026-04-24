@@ -5,12 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "dev:full": "node server.js & vite",
     "server": "node server.js",
     "build": "vite build",
-    "build:cf": "vite build",
     "deploy:cf": "wrangler pages deploy dist",
-    "deploy:worker": "wrangler deploy worker.js",
+    "deploy:worker": "wrangler deploy --config wrangler-worker.toml",
     "deploy:all": "npm run build && npm run deploy:cf && npm run deploy:worker",
     "lint": "eslint .",
     "preview": "vite preview"

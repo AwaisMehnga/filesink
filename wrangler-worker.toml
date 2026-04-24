@@ -1,0 +1,4 @@
+name = "speech-to-text"
+compatibility_date = "2026-04-24"
+main = "worker.js"
+compatibility_flags = ["nodejs_compat"]
