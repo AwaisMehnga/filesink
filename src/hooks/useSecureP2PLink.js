@@ -5,6 +5,7 @@ const CHUNK_SIZE = 16 * 1024;
 const BUFFER_LIMIT = CHUNK_SIZE * 64;
 const SESSION_STORAGE_KEY = 'secure-p2p-session';
 const MAX_ICE_GATHER_WAIT_MS = 1200;
+const STATUS_POLL_INTERVAL_MS = 1500;
 
 const waitForIceGatheringComplete = (pc) =>
   new Promise((resolve) => {
@@ -132,6 +133,64 @@ const clearStoredSession = () => {
   }
 };
 
+const isLocalhostHost = (hostname) => hostname === 'localhost' || hostname === '127.0.0.1';
+const isPrivateIpv4Hostname = (hostname) => {
+  if (!hostname) {
+    return false;
+  }
+
+  if (hostname.startsWith('10.')) {
+    return true;
+  }
+
+  if (hostname.startsWith('192.168.')) {
+    return true;
+  }
+
+  const match = hostname.match(/^172\.(\d{1,3})\./);
+  if (!match) {
+    return false;
+  }
+
+  const secondOctet = Number(match[1]);
+  return secondOctet >= 16 && secondOctet <= 31;
+};
+
+const getNetworkModeFromBase = (base) => {
+  try {
+    const { hostname } = new URL(base);
+    return isLocalhostHost(hostname) || isPrivateIpv4Hostname(hostname) ? 'lan' : 'internet';
+  } catch {
+    return 'internet';
+  }
+};
+
+const buildSigHint = (signalingBase, localIP = '') => {
+  try {
+    const { hostname, port, protocol } = new URL(signalingBase);
+    if (isLocalhostHost(hostname)) {
+      if (!localIP) {
+        return '';
+      }
+
+      return `${protocol}//${localIP}${port ? `:${port}` : ''}`;
+    }
+
+    if (isPrivateIpv4Hostname(hostname)) {
+      return signalingBase;
+    }
+
+    return '';
+  } catch {
+    return '';
+  }
+};
+
+const extractCandidateType = (candidate = '') => {
+  const match = String(candidate).match(/\btyp\s+([a-z]+)/i);
+  return match?.[1]?.toLowerCase() || '';
+};
+
 export function useSecureP2PLink() {
   const [connectionStatus, setConnectionStatus] = useState('Idle');
   const [connectionDetail, setConnectionDetail] = useState('Create a secure connection URL.');
@@ -162,6 +221,34 @@ export function useSecureP2PLink() {
   const incomingFileRef = useRef(null);
 
   const envSignaling = useMemo(() => import.meta.env.VITE_SIGNALING_URL || '', []);
+  const stunUrls = useMemo(() => {
+    const configured = (import.meta.env.VITE_STUN_URLS || '')
+      .split(',')
+      .map((url) => url.trim())
+      .filter(Boolean);
+
+    if (configured.length) {
+      return configured;
+    }
+
+    return ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'];
+  }, []);
+  const turnConfig = useMemo(
+    () => ({
+      url: import.meta.env.VITE_TURN_URL || '',
+      username: import.meta.env.VITE_TURN_USERNAME || '',
+      credential: import.meta.env.VITE_TURN_CREDENTIAL || '',
+    }),
+    [],
+  );
+  const hasTurnConfigured = useMemo(
+    () => Boolean(turnConfig.url && turnConfig.username && turnConfig.credential),
+    [turnConfig],
+  );
+  const hasPartialTurnConfig = useMemo(
+    () => Boolean(turnConfig.url || turnConfig.username || turnConfig.credential) && !hasTurnConfigured,
+    [hasTurnConfigured, turnConfig],
+  );
 
   const cleanupPolling = useCallback(() => {
     if (answerPollRef.current) {
@@ -178,16 +265,16 @@ export function useSecureP2PLink() {
       clearTimeout(hostReconnectTimeoutRef.current);
       hostReconnectTimeoutRef.current = null;
     }
-  }, []);
-
-  const cleanupConnection = useCallback(() => {
-    cleanupPolling();
-    incomingFileRef.current = null;
 
     if (peerSessionPollRef.current) {
       clearInterval(peerSessionPollRef.current);
       peerSessionPollRef.current = null;
     }
+  }, []);
+
+  const cleanupConnection = useCallback(() => {
+    cleanupPolling();
+    incomingFileRef.current = null;
 
     if (channelRef.current) {
       channelRef.current.onopen = null;
@@ -204,28 +291,124 @@ export function useSecureP2PLink() {
     }
   }, [cleanupPolling]);
 
-  const buildIceServers = useCallback(() => {
-    const servers = [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' },
-    ];
+  const revokeReceivedFileUrls = useCallback(() => {
+    setReceivedFiles((prev) => {
+      prev.forEach((file) => {
+        try {
+          URL.revokeObjectURL(file.url);
+        } catch {
+          // Ignore URL cleanup errors.
+        }
+      });
+      return [];
+    });
+  }, []);
 
-    if (import.meta.env.VITE_TURN_URL && import.meta.env.VITE_TURN_USERNAME && import.meta.env.VITE_TURN_CREDENTIAL) {
+  const buildIceServers = useCallback(() => {
+    const servers = stunUrls.map((url) => ({ urls: url }));
+
+    if (hasTurnConfigured) {
       servers.push({
-        urls: import.meta.env.VITE_TURN_URL,
-        username: import.meta.env.VITE_TURN_USERNAME,
-        credential: import.meta.env.VITE_TURN_CREDENTIAL,
+        urls: turnConfig.url,
+        username: turnConfig.username,
+        credential: turnConfig.credential,
       });
     }
 
     return servers;
-  }, []);
+  }, [hasTurnConfigured, stunUrls, turnConfig]);
+
+  const diagnoseIceFailure = useCallback(async (pc) => {
+    const observedTypes = new Set();
+
+    try {
+      const stats = await pc.getStats();
+      stats.forEach((report) => {
+        if (report.type === 'local-candidate' || report.type === 'remote-candidate') {
+          if (report.candidateType) {
+            observedTypes.add(report.candidateType);
+          }
+        }
+
+        if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+          if (report.localCandidateId) {
+            const local = stats.get(report.localCandidateId);
+            if (local?.candidateType) {
+              observedTypes.add(local.candidateType);
+            }
+          }
+
+          if (report.remoteCandidateId) {
+            const remote = stats.get(report.remoteCandidateId);
+            if (remote?.candidateType) {
+              observedTypes.add(remote.candidateType);
+            }
+          }
+        }
+      });
+    } catch {
+      // Ignore stats errors and fall back to generic guidance.
+    }
+
+    if (hasPartialTurnConfig) {
+      return 'Connection failed. TURN is only partially configured; set VITE_TURN_URL, VITE_TURN_USERNAME, and VITE_TURN_CREDENTIAL.';
+    }
+
+    if (!hasTurnConfigured) {
+      return 'Connection failed. Different networks usually need a TURN relay; only STUN is configured right now.';
+    }
+
+    if (!observedTypes.size) {
+      return 'Connection failed after signaling. TURN is configured, but ICE could not find any usable network path.';
+    }
+
+    if (!observedTypes.has('relay')) {
+      return `Connection failed. ICE candidates were ${Array.from(observedTypes).join(', ') || 'unavailable'}, but no relay path succeeded.`;
+    }
+
+    return 'Connection failed. A relay candidate existed, but the TURN route still did not connect.';
+  }, [hasPartialTurnConfig, hasTurnConfigured]);
 
   const setupPeer = useCallback((peerRole) => {
     const pc = new RTCPeerConnection({
       iceServers: buildIceServers(),
       iceCandidatePoolSize: 2,
     });
+
+    pc.onicecandidate = (event) => {
+      const candidateType = extractCandidateType(event.candidate?.candidate || '');
+      if (candidateType) {
+        console.debug('[webrtc] local ICE candidate', { type: candidateType, role: peerRole });
+      }
+    };
+
+    pc.onicecandidateerror = (event) => {
+      console.warn('[webrtc] ICE candidate error', {
+        role: peerRole,
+        address: event.address,
+        port: event.port,
+        url: event.url,
+        errorCode: event.errorCode,
+        errorText: event.errorText,
+      });
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      const state = pc.iceConnectionState;
+
+      if (state === 'checking') {
+        setConnectionDetail('Exchanging ICE candidates and testing network paths...');
+      } else if (state === 'connected' || state === 'completed') {
+        setConnectionDetail('ICE connected. Opening secure data channel...');
+      } else if (state === 'failed') {
+        diagnoseIceFailure(pc).then((message) => {
+          if (peerRef.current === pc) {
+            setConnectionStatus('Failed');
+            setConnectionDetail(message);
+          }
+        });
+      }
+    };
 
     pc.onconnectionstatechange = () => {
       const state = pc.connectionState;
@@ -238,8 +421,13 @@ export function useSecureP2PLink() {
         setConnectionStatus('Connecting');
         setConnectionDetail('Negotiating secure peer channel...');
       } else if (state === 'failed') {
+        cleanupPolling();
         setConnectionStatus('Failed');
-        setConnectionDetail('Connection failed. Check network or TURN setup.');
+        diagnoseIceFailure(pc).then((message) => {
+          if (peerRef.current === pc) {
+            setConnectionDetail(message);
+          }
+        });
       } else if (state === 'disconnected' || state === 'closed') {
         setConnectionStatus('Closed');
         setConnectionDetail('Peer disconnected.');
@@ -286,35 +474,64 @@ export function useSecureP2PLink() {
 
     peerRef.current = pc;
     return pc;
-  }, [buildIceServers, cleanupPolling]);
+  }, [buildIceServers, cleanupPolling, diagnoseIceFailure]);
 
   const startStatusPolling = useCallback((base, sessionId, key) => {
+    let inFlight = false;
+
     const pollStatus = async () => {
+      if (inFlight) {
+        return;
+      }
+
+      inFlight = true;
       try {
         const data = await requestJson(`${base}/api/session/${sessionId}/status?key=${encodeURIComponent(key)}`, {}, 4000);
         if (data.status === 'joined') {
           setConnectionStatus('Peer Joined');
           setConnectionDetail('Peer opened your URL and is creating answer.');
         }
+        if (data.status === 'answered' || data.status === 'connected') {
+          if (sessionStatusPollRef.current) {
+            clearInterval(sessionStatusPollRef.current);
+            sessionStatusPollRef.current = null;
+          }
+        }
       } catch {
         // Ignore transient polling errors.
+      } finally {
+        inFlight = false;
       }
     };
 
     pollStatus();
-    sessionStatusPollRef.current = setInterval(pollStatus, 500);
+    sessionStatusPollRef.current = setInterval(pollStatus, STATUS_POLL_INTERVAL_MS);
   }, []);
 
   const startPeerSessionPolling = useCallback((offerToken, sigHint, signalingBase) => {
     const { sessionId, key } = parseOfferToken(offerToken);
+    let inFlight = false;
 
     const pollSession = async () => {
+      if (inFlight) {
+        return;
+      }
+
+      inFlight = true;
       try {
         const data = await requestJson(
           `${signalingBase}/api/session/${sessionId}/status?key=${encodeURIComponent(key)}`,
           {},
           4000,
         );
+
+        if (data.status === 'answered' || data.status === 'connected') {
+          if (peerSessionPollRef.current) {
+            clearInterval(peerSessionPollRef.current);
+            peerSessionPollRef.current = null;
+          }
+          return;
+        }
 
         if (data.status !== 'waiting' || peerReconnectInFlightRef.current) {
           return;
@@ -337,11 +554,13 @@ export function useSecureP2PLink() {
         });
       } catch {
         // Ignore transient polling errors.
+      } finally {
+        inFlight = false;
       }
     };
 
     pollSession();
-    peerSessionPollRef.current = setInterval(pollSession, 500);
+    peerSessionPollRef.current = setInterval(pollSession, STATUS_POLL_INTERVAL_MS);
   }, []);
 
   const beginHostAnswerPolling = useCallback((base, sessionId, key) => {
@@ -473,28 +692,49 @@ export function useSecureP2PLink() {
   }, [cleanupPolling]);
 
   const getHostSignalingCandidates = useCallback(() => {
-    const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+    const isLocalhost = isLocalhostHost(window.location.hostname);
+    const sameOrigin = window.location.origin;
+
+    if (isLocalhost) {
+      return uniqueBases([
+        'http://localhost:3000',
+        envSignaling,
+        DEFAULT_CLOUD_SIGNALING,
+      ]);
+    }
+
     return uniqueBases([
-      'http://localhost:3000',
       envSignaling,
-      isLocalhost ? '' : DEFAULT_CLOUD_SIGNALING,
+      sameOrigin,
+      DEFAULT_CLOUD_SIGNALING,
     ]);
   }, [envSignaling]);
 
   const getJoinSignalingCandidates = useCallback((sigHint) => {
-    const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+    const isLocalhost = isLocalhostHost(window.location.hostname);
+    const sameOrigin = window.location.origin;
+
+    if (isLocalhost) {
+      return uniqueBases([
+        sigHint,
+        'http://localhost:3000',
+        envSignaling,
+        DEFAULT_CLOUD_SIGNALING,
+      ]);
+    }
+
     return uniqueBases([
-      sigHint,
       envSignaling,
-      'http://localhost:3000',
-      isLocalhost ? '' : DEFAULT_CLOUD_SIGNALING,
+      sameOrigin,
+      DEFAULT_CLOUD_SIGNALING,
+      sigHint,
     ]);
   }, [envSignaling]);
 
-  const buildShareUrl = useCallback((offerToken, signalingBase, localIP = '') => {
+  const buildShareUrl = useCallback((offerToken, sigHint = '') => {
     const params = new URLSearchParams({ offer: offerToken });
-    if (signalingBase === 'http://localhost:3000' && localIP) {
-      params.set('sig', `http://${localIP}:3000`);
+    if (sigHint) {
+      params.set('sig', sigHint);
     }
     return `${window.location.origin}/?${params.toString()}`;
   }, []);
@@ -551,17 +791,18 @@ export function useSecureP2PLink() {
 
     setActiveSignalingBase(selectedBase);
 
-    const mode = storedMode || (selectedBase === 'http://localhost:3000' ? 'lan' : 'internet');
+    const resolvedSigHint = buildSigHint(selectedBase, updateResult.localIP || '');
+    const mode = storedMode || getNetworkModeFromBase(resolvedSigHint || selectedBase);
     setNetworkMode(mode);
 
-    setShareUrl(buildShareUrl(offerToken, selectedBase, updateResult.localIP || ''));
+    setShareUrl(buildShareUrl(offerToken, resolvedSigHint));
 
     setStoredSession({
       offerToken,
       role: 'host',
       signalingBase: selectedBase,
       networkMode: mode,
-      sigHint: selectedBase === 'http://localhost:3000' && updateResult.localIP ? `http://${updateResult.localIP}:3000` : '',
+      sigHint: resolvedSigHint,
     });
 
     setConnectionStatus('Awaiting Peer');
@@ -620,27 +861,27 @@ export function useSecureP2PLink() {
       }
 
       if (!createdSession || !selectedBase) {
-        throw new Error('Unable to reach signaling server');
+        throw new Error(
+          isLocalhostHost(window.location.hostname)
+            ? 'Unable to reach signaling server'
+            : 'Public signaling server is not configured or unreachable. Set VITE_SIGNALING_URL for live deploys.',
+        );
       }
 
       const { sessionId, key } = parseOfferToken(createdSession.offerToken);
       setActiveSignalingBase(selectedBase);
 
-      if (selectedBase === 'http://localhost:3000' && createdSession.localIP) {
-        setNetworkMode('lan');
-      } else {
-        setNetworkMode('internet');
-      }
+      const persistedSigHint = buildSigHint(selectedBase, createdSession.localIP || '');
+      setNetworkMode(getNetworkModeFromBase(persistedSigHint || selectedBase));
 
-      const shareLink = buildShareUrl(createdSession.offerToken, selectedBase, createdSession.localIP || '');
+      const shareLink = buildShareUrl(createdSession.offerToken, persistedSigHint);
       setShareUrl(shareLink);
 
-      const persistedSigHint = selectedBase === 'http://localhost:3000' && createdSession.localIP ? `http://${createdSession.localIP}:3000` : '';
       setStoredSession({
         offerToken: createdSession.offerToken,
         role: 'host',
         signalingBase: selectedBase,
-        networkMode: selectedBase === 'http://localhost:3000' ? 'lan' : 'internet',
+        networkMode: getNetworkModeFromBase(persistedSigHint || selectedBase),
         sigHint: persistedSigHint,
       });
 
@@ -695,17 +936,24 @@ export function useSecureP2PLink() {
 
         if (!sessionData || !selectedBase) {
           clearStoredSession();
-          throw lastError || new Error('Offer was not found, expired, or already used');
+          throw (
+            lastError
+            || new Error(
+              isLocalhostHost(window.location.hostname)
+                ? 'Offer was not found, expired, or already used'
+                : 'Offer could not be loaded from a public signaling server. Check VITE_SIGNALING_URL or the shared link.',
+            )
+          );
         }
 
         setActiveSignalingBase(selectedBase);
-        setNetworkMode(selectedBase.startsWith('http://192.') || selectedBase.startsWith('http://10.') ? 'lan' : 'internet');
+        setNetworkMode(getNetworkModeFromBase(selectedBase));
 
         setStoredSession({
           offerToken,
           role: 'peer',
           signalingBase: selectedBase,
-          networkMode: selectedBase.startsWith('http://192.') || selectedBase.startsWith('http://10.') ? 'lan' : 'internet',
+          networkMode: getNetworkModeFromBase(selectedBase),
           sigHint,
         });
 
@@ -807,6 +1055,34 @@ export function useSecureP2PLink() {
     setSelectedFiles(Array.from(files || []));
   }, []);
 
+  const clearAllFiles = useCallback(() => {
+    setSelectedFiles([]);
+    setCurrentSendName('');
+    setSendProgress(0);
+    setCurrentReceiveName('');
+    setReceiveProgress(0);
+    incomingFileRef.current = null;
+    revokeReceivedFileUrls();
+  }, [revokeReceivedFileUrls]);
+
+  const disconnect = useCallback(() => {
+    cleanupConnection();
+    clearStoredSession();
+    clearAllFiles();
+    setShareUrl('');
+    setRole('host');
+    setError('');
+    setActiveSignalingBase('');
+    setNetworkMode('internet');
+    setIsSending(false);
+    setConnectionStatus('Idle');
+    setConnectionDetail('Create a secure connection URL.');
+    autoJoinRef.current = '';
+
+    const cleanUrl = `${window.location.origin}${window.location.pathname}`;
+    window.history.replaceState({}, '', cleanUrl);
+  }, [cleanupConnection, clearAllFiles]);
+
   useEffect(() => {
     resumeHostSessionRef.current = resumeHostSession;
     joinFromOfferTokenRef.current = joinFromOfferToken;
@@ -853,8 +1129,10 @@ export function useSecureP2PLink() {
 
     return () => {
       cleanupConnection();
+      revokeReceivedFileUrls();
+      autoJoinRef.current = '';
     };
-  }, [cleanupConnection, joinFromOfferToken, resumeHostSession]);
+  }, [cleanupConnection, joinFromOfferToken, resumeHostSession, revokeReceivedFileUrls]);
 
   return {
     connectionStatus,
@@ -876,5 +1154,7 @@ export function useSecureP2PLink() {
     createConnectionUrl,
     selectFiles,
     sendSelectedFiles,
+    disconnect,
+    clearAllFiles,
   };
 }

@@ -1,3 +1,8 @@
 name = "filesink"
 compatibility_date = "2026-04-24"
 pages_build_output_dir = "dist"
+
+[[kv_namespaces]]
+binding = "SIGNALING_SESSIONS"
+id = "f82ce1e578d347fa8e5dff8842b1a8de"
+preview_id = "c2b6dac187444a0fb92a8759e32cad46"

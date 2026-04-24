@@ -1,72 +1,47 @@
-:root {
-  font-family: sans-serif;
+@import "tailwindcss";
+
+@theme {
+  --color-brand-50: #f4f4f5;
+  --color-brand-100: #e4e4e7;
+  --color-brand-200: #d4d4d8;
+  --color-brand-500: #121212;
+  --color-brand-600: #0a0a0a;
 }
 
-html,
-body,
-#root {
-  width: 100%;
-  height: 100%;
-  margin: 0;
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  html {
+    font-family: "IBM Plex Mono", "Courier New", monospace;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background:
+      linear-gradient(90deg, rgba(0, 0, 0, 0.06) 1px, transparent 1px),
+      linear-gradient(rgba(0, 0, 0, 0.06) 1px, transparent 1px),
+      #ffffff;
+    background-size: 28px 28px;
+  }
+
+  button,
+  input,
+  textarea,
+  a {
+    font: inherit;
+  }
 }
 
-.app-shell {
-  width: 100%;
-  min-height: 100%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: #f3f4f6;
-}
+@layer utilities {
+  .scrollbar-hidden {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
 
-.card {
-  width: min(680px, 92vw);
-  padding: 24px;
-  border-radius: 12px;
-  background: #ffffff;
-  border: 1px solid #d1d5db;
-  display: grid;
-  gap: 12px;
-}
-
-.primary-btn {
-  justify-self: center;
-  padding: 12px 18px;
-  border-radius: 10px;
-  border: 1px solid #111827;
-  background: #111827;
-  color: #ffffff;
-  cursor: pointer;
-}
-
-.share-url {
-  width: 100%;
-  min-height: 88px;
-  resize: vertical;
-}
-
-.error {
-  color: #b91c1c;
-}
-
-.file-picker {
-  display: inline-block;
-  width: fit-content;
-  padding: 8px 12px;
-  border: 1px solid #111827;
-  border-radius: 8px;
-  cursor: pointer;
-}
-
-#file-input {
-  display: none;
-}
-
-.list-block {
-  display: grid;
-  gap: 6px;
-}
-
-.list-block a {
-  color: #1d4ed8;
+  .scrollbar-hidden::-webkit-scrollbar {
+    display: none;
+  }
 }

@@ -1,0 +1,13 @@
+{
+  "routes": [
+    {
+      "routePath": "/api/:route*",
+      "mountPath": "/api",
+      "method": "",
+      "module": [
+        "api/[[route]].js:onRequest"
+      ]
+    }
+  ],
+  "baseURL": "/"
+}

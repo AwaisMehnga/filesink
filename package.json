@@ -7,11 +7,7 @@
     "dev": "vite",
     "server": "node server.js",
     "build": "vite build",
-    "deploy:cf": "wrangler pages deploy dist",
-    "deploy:worker": "wrangler deploy --config wrangler-worker.toml",
-    "deploy:all": "npm run build && npm run deploy:cf && npm run deploy:worker",
-    "lint": "eslint .",
-    "preview": "vite preview"
+    "deploy": "npm run build && wrangler pages deploy dist && wrangler deploy --config wrangler-worker.toml"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.2.4",
