@@ -1,0 +1,13 @@
+name = "speech-to-text"
+compatibility_date = "2026-04-24"
+pages_build_output_dir = "dist"
+
+# Cloudflare Worker for signaling server
+[env.production]
+routes = [
+  { pattern = "api.example.com/api/*", zone_name = "example.com" }
+]
+
+# Development configuration
+main = "worker.js"
+compatibility_flags = ["nodejs_compat"]
