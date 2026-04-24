@@ -1,4 +1,6 @@
 import { Buffer } from 'node:buffer';
+import fs from 'node:fs';
+import path from 'node:path';
 import process from 'node:process';
 import cors from 'cors';
 import crypto from 'crypto';
@@ -8,6 +10,7 @@ import os from 'os';
 const app = express();
 const PORT = process.env.PORT || 3000;
 const MAX_SESSION_AGE_MS = 5 * 60 * 1000;
+const SESSION_STORE_FILE = path.join(process.cwd(), '.signaling-sessions.json');
 
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
@@ -16,15 +19,51 @@ const sessions = new Map();
 
 const now = () => Date.now();
 
-const cleanupExpiredSessions = () => {
-  const currentTime = now();
-  for (const [sessionId, session] of sessions.entries()) {
-    if (currentTime - session.createdAt > MAX_SESSION_AGE_MS) {
-      sessions.delete(sessionId);
+const loadSessionsFromDisk = () => {
+  try {
+    if (!fs.existsSync(SESSION_STORE_FILE)) {
+      return;
     }
+
+    const raw = fs.readFileSync(SESSION_STORE_FILE, 'utf8');
+    if (!raw) {
+      return;
+    }
+
+    const parsed = JSON.parse(raw);
+    for (const [sessionId, session] of Object.entries(parsed)) {
+      sessions.set(sessionId, session);
+    }
+  } catch (error) {
+    console.warn('Failed to load signaling sessions from disk:', error.message);
   }
 };
 
+const saveSessionsToDisk = () => {
+  try {
+    const serialized = Object.fromEntries(sessions.entries());
+    fs.writeFileSync(SESSION_STORE_FILE, JSON.stringify(serialized), 'utf8');
+  } catch (error) {
+    console.warn('Failed to save signaling sessions to disk:', error.message);
+  }
+};
+
+const cleanupExpiredSessions = () => {
+  const currentTime = now();
+  let changed = false;
+  for (const [sessionId, session] of sessions.entries()) {
+    if (currentTime - session.createdAt > MAX_SESSION_AGE_MS) {
+      sessions.delete(sessionId);
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    saveSessionsToDisk();
+  }
+};
+
+loadSessionsFromDisk();
 setInterval(cleanupExpiredSessions, 30000);
 
 const getLocalIP = () => {
@@ -86,6 +125,7 @@ app.post('/api/session', (req, res) => {
     status: 'waiting',
     createdAt: now(),
   });
+  saveSessionsToDisk();
 
   const localIP = getLocalIP();
 
@@ -104,6 +144,7 @@ app.get('/api/session/:sessionId', (req, res) => {
 
   if (session.status === 'waiting') {
     session.status = 'joined';
+    saveSessionsToDisk();
   }
 
   return res.json({
@@ -127,6 +168,7 @@ app.put('/api/session/:sessionId/offer', (req, res) => {
   session.answer = null;
   session.status = 'waiting';
   session.createdAt = now();
+  saveSessionsToDisk();
 
   return res.json({
     ok: true,
@@ -148,6 +190,7 @@ app.post('/api/session/:sessionId/answer', (req, res) => {
 
   session.answer = answer;
   session.status = 'answered';
+  saveSessionsToDisk();
 
   return res.json({ ok: true, status: session.status });
 });
@@ -163,6 +206,7 @@ app.get('/api/session/:sessionId/answer', (req, res) => {
   }
 
   session.status = 'connected';
+  saveSessionsToDisk();
 
   return res.json({
     answer: session.answer,

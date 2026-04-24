@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-const DEFAULT_CLOUD_SIGNALING = 'https://speech-to-text.reactssrtest.workers.dev';
+const DEFAULT_CLOUD_SIGNALING = '';
 const CHUNK_SIZE = 16 * 1024;
 const BUFFER_LIMIT = CHUNK_SIZE * 64;
 const SESSION_STORAGE_KEY = 'secure-p2p-session';
+const MAX_ICE_GATHER_WAIT_MS = 1200;
 
 const waitForIceGatheringComplete = (pc) =>
   new Promise((resolve) => {
@@ -12,8 +13,14 @@ const waitForIceGatheringComplete = (pc) =>
       return;
     }
 
+    const timeout = setTimeout(() => {
+      pc.removeEventListener('icegatheringstatechange', onChange);
+      resolve();
+    }, MAX_ICE_GATHER_WAIT_MS);
+
     const onChange = () => {
       if (pc.iceGatheringState === 'complete') {
+        clearTimeout(timeout);
         pc.removeEventListener('icegatheringstatechange', onChange);
         resolve();
       }
@@ -98,7 +105,7 @@ const formatSize = (bytes) => {
 
 const getStoredSession = () => {
   try {
-    const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+    const raw = sessionStorage.getItem(SESSION_STORAGE_KEY);
     if (!raw) return null;
     return JSON.parse(raw);
   } catch {
@@ -108,7 +115,15 @@ const getStoredSession = () => {
 
 const setStoredSession = (session) => {
   try {
-    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
+    sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
+  } catch {
+    // Ignore storage errors.
+  }
+};
+
+const clearStoredSession = () => {
+  try {
+    sessionStorage.removeItem(SESSION_STORAGE_KEY);
   } catch {
     // Ignore storage errors.
   }
@@ -134,6 +149,12 @@ function App() {
   const channelRef = useRef(null);
   const answerPollRef = useRef(null);
   const sessionStatusPollRef = useRef(null);
+  const peerSessionPollRef = useRef(null);
+  const hostReconnectTimeoutRef = useRef(null);
+  const hostReconnectInFlightRef = useRef(false);
+  const peerReconnectInFlightRef = useRef(false);
+  const joinFromOfferTokenRef = useRef(null);
+  const resumeHostSessionRef = useRef(null);
   const sessionRef = useRef({ sessionId: '', key: '' });
   const autoJoinRef = useRef('');
   const incomingFileRef = useRef(null);
@@ -150,11 +171,21 @@ function App() {
       clearInterval(sessionStatusPollRef.current);
       sessionStatusPollRef.current = null;
     }
+
+    if (hostReconnectTimeoutRef.current) {
+      clearTimeout(hostReconnectTimeoutRef.current);
+      hostReconnectTimeoutRef.current = null;
+    }
   }, []);
 
   const cleanupConnection = useCallback(() => {
     cleanupPolling();
     incomingFileRef.current = null;
+
+    if (peerSessionPollRef.current) {
+      clearInterval(peerSessionPollRef.current);
+      peerSessionPollRef.current = null;
+    }
 
     if (channelRef.current) {
       channelRef.current.onopen = null;
@@ -246,9 +277,10 @@ function App() {
     return servers;
   }, []);
 
-  const setupPeer = useCallback(() => {
+  const setupPeer = useCallback((peerRole) => {
     const pc = new RTCPeerConnection({
       iceServers: buildIceServers(),
+      iceCandidatePoolSize: 2,
     });
 
     pc.onconnectionstatechange = () => {
@@ -267,6 +299,44 @@ function App() {
       } else if (state === 'disconnected' || state === 'closed') {
         setConnectionStatus('Closed');
         setConnectionDetail('Peer disconnected.');
+
+        if (
+          peerRole === 'host'
+          && !hostReconnectTimeoutRef.current
+          && getStoredSession()?.role === 'host'
+        ) {
+          hostReconnectTimeoutRef.current = setTimeout(() => {
+            hostReconnectTimeoutRef.current = null;
+
+            if (hostReconnectInFlightRef.current) {
+              return;
+            }
+
+            const storedSession = getStoredSession();
+            if (!storedSession?.offerToken || storedSession.role !== 'host') {
+              return;
+            }
+
+            hostReconnectInFlightRef.current = true;
+            setConnectionStatus('Reconnecting');
+            setConnectionDetail('Peer disconnected. Publishing a fresh secure offer...');
+
+            const reconnect = resumeHostSessionRef.current?.(storedSession);
+            if (!reconnect) {
+              hostReconnectInFlightRef.current = false;
+              return;
+            }
+
+            reconnect
+              .catch((err) => {
+                clearStoredSession();
+                setError(err.message || 'Could not restore host session.');
+              })
+              .finally(() => {
+                hostReconnectInFlightRef.current = false;
+              });
+          }, 1200);
+        }
       }
     };
 
@@ -275,7 +345,7 @@ function App() {
   }, [buildIceServers, cleanupPolling]);
 
   const startStatusPolling = useCallback((base, sessionId, key) => {
-    sessionStatusPollRef.current = setInterval(async () => {
+    const pollStatus = async () => {
       try {
         const data = await requestJson(`${base}/api/session/${sessionId}/status?key=${encodeURIComponent(key)}`, {}, 4000);
         if (data.status === 'joined') {
@@ -285,11 +355,53 @@ function App() {
       } catch {
         // Ignore transient polling errors.
       }
-    }, 1500);
+    };
+
+    pollStatus();
+    sessionStatusPollRef.current = setInterval(pollStatus, 500);
+  }, []);
+
+  const startPeerSessionPolling = useCallback((offerToken, sigHint, signalingBase) => {
+    const { sessionId, key } = parseOfferToken(offerToken);
+
+    const pollSession = async () => {
+      try {
+        const data = await requestJson(
+          `${signalingBase}/api/session/${sessionId}/status?key=${encodeURIComponent(key)}`,
+          {},
+          4000,
+        );
+
+        if (data.status !== 'waiting' || peerReconnectInFlightRef.current) {
+          return;
+        }
+
+        const currentState = peerRef.current?.connectionState;
+        if (currentState === 'connecting') {
+          return;
+        }
+
+        peerReconnectInFlightRef.current = true;
+        const reconnect = joinFromOfferTokenRef.current?.(offerToken, sigHint || signalingBase);
+        if (!reconnect) {
+          peerReconnectInFlightRef.current = false;
+          return;
+        }
+
+        reconnect.finally(() => {
+          peerReconnectInFlightRef.current = false;
+        });
+      } catch {
+        // Ignore transient polling errors.
+      }
+    };
+
+    pollSession();
+    peerSessionPollRef.current = setInterval(pollSession, 500);
   }, []);
 
   const beginHostAnswerPolling = useCallback((base, sessionId, key) => {
-    answerPollRef.current = setInterval(async () => {
+    const pollAnswer = async () => {
       if (!peerRef.current) {
         return;
       }
@@ -315,7 +427,10 @@ function App() {
       } catch {
         // Ignore transient polling errors.
       }
-    }, 1000);
+    };
+
+    pollAnswer();
+    answerPollRef.current = setInterval(pollAnswer, 400);
   }, []);
 
   const setSecureChannelHandlers = useCallback(() => {
@@ -414,19 +529,21 @@ function App() {
   }, [cleanupPolling]);
 
   const getHostSignalingCandidates = useCallback(() => {
+    const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
     return uniqueBases([
       'http://localhost:3000',
       envSignaling,
-      DEFAULT_CLOUD_SIGNALING,
+      isLocalhost ? '' : DEFAULT_CLOUD_SIGNALING,
     ]);
   }, [envSignaling]);
 
   const getJoinSignalingCandidates = useCallback((sigHint) => {
+    const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
     return uniqueBases([
       sigHint,
       envSignaling,
       'http://localhost:3000',
-      DEFAULT_CLOUD_SIGNALING,
+      isLocalhost ? '' : DEFAULT_CLOUD_SIGNALING,
     ]);
   }, [envSignaling]);
 
@@ -445,7 +562,7 @@ function App() {
     }
 
     const { sessionId, key } = parseOfferToken(offerToken);
-    const candidates = uniqueBases([storedBase, 'http://localhost:3000', envSignaling, DEFAULT_CLOUD_SIGNALING]);
+    const candidates = uniqueBases([storedBase]);
 
     cleanupConnection();
     setRole('host');
@@ -453,7 +570,7 @@ function App() {
     setConnectionStatus('Reconnecting');
     setConnectionDetail('Restoring host session after reload...');
 
-    const pc = setupPeer();
+    const pc = setupPeer('host');
     const channel = pc.createDataChannel('secure-link', { ordered: true });
     channelRef.current = channel;
     setSecureChannelHandlers();
@@ -484,7 +601,8 @@ function App() {
     }
 
     if (!selectedBase || !updateResult) {
-      throw new Error('Failed to restore host session. Generate a new URL.');
+      clearStoredSession();
+      throw new Error('Stored session expired or signaling server changed. Generate a new URL.');
     }
 
     sessionRef.current = { sessionId, key };
@@ -513,7 +631,6 @@ function App() {
     beginHostAnswerPolling,
     buildShareUrl,
     cleanupConnection,
-    envSignaling,
     setSecureChannelHandlers,
     setupPeer,
     startStatusPolling,
@@ -528,7 +645,7 @@ function App() {
       setConnectionStatus('Creating Offer');
       setConnectionDetail('Preparing secure WebRTC offer...');
 
-      const pc = setupPeer();
+      const pc = setupPeer('host');
       const channel = pc.createDataChannel('secure-link', { ordered: true });
       channelRef.current = channel;
       setSecureChannelHandlers();
@@ -645,6 +762,7 @@ function App() {
         }
 
         if (!sessionData || !selectedBase) {
+          clearStoredSession();
           throw lastError || new Error('Offer was not found, expired, or already used');
         }
 
@@ -659,7 +777,7 @@ function App() {
           sigHint,
         });
 
-        const pc = setupPeer();
+        const pc = setupPeer('peer');
         pc.ondatachannel = (event) => {
           channelRef.current = event.channel;
           setSecureChannelHandlers();
@@ -682,14 +800,23 @@ function App() {
 
         setConnectionStatus('Answer Sent');
         setConnectionDetail('Waiting for host to finalize secure connection.');
+        startPeerSessionPolling(offerToken, sigHint, selectedBase);
       } catch (err) {
+        if (err?.status === 403 || err?.status === 404) {
+          clearStoredSession();
+        }
         setError(err.message || 'Failed to join connection');
         setConnectionStatus('Idle');
         setConnectionDetail('Open a valid URL and try again.');
       }
     },
-    [cleanupConnection, getJoinSignalingCandidates, setSecureChannelHandlers, setupPeer],
+    [cleanupConnection, getJoinSignalingCandidates, setSecureChannelHandlers, setupPeer, startPeerSessionPolling],
   );
+
+  useEffect(() => {
+    resumeHostSessionRef.current = resumeHostSession;
+    joinFromOfferTokenRef.current = joinFromOfferToken;
+  }, [joinFromOfferToken, resumeHostSession]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -716,6 +843,7 @@ function App() {
     if (stored?.offerToken && stored?.role === 'host') {
       queueMicrotask(() => {
         resumeHostSession(stored).catch((err) => {
+            clearStoredSession();
           setError(err.message || 'Could not restore host session.');
         });
       });
