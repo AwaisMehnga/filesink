@@ -50,4 +50,4 @@ Important:
 
 - This app is LAN-only.
 - Both devices must be on the same network.
-- Cross-network and internet relay support were intentionally removed.
+- Cross-network and internet relay support will be added soon.
